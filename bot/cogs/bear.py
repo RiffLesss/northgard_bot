@@ -26,6 +26,7 @@ PLACE_EMOJIS = {
     2: "🥈",
     3: "🥉",
 }
+last_tierlist_message_ids: dict[int, list[int]] = {}
 
 
 class AcceptChallengeView(discord.ui.View):
@@ -108,6 +109,15 @@ async def delete_message(message: discord.Message | discord.WebhookMessage) -> N
         await message.delete()
     except (discord.Forbidden, discord.NotFound):
         pass
+
+
+async def delete_messages_by_ids(channel: discord.abc.Messageable, message_ids: list[int]) -> None:
+    for message_id in message_ids:
+        try:
+            message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+        except (AttributeError, discord.Forbidden, discord.NotFound):
+            continue
+        await delete_message(message)
 
 
 def personal_score_text(match: BearMatch, first_user: User, second_user: User) -> str:
@@ -255,8 +265,12 @@ def register(bot: commands.Bot, settings: Settings) -> None:
                 ephemeral=True,
             )
             return
+        if interaction.channel is None or interaction.channel_id is None:
+            await interaction.response.send_message("Не удалось определить канал тирлиста.", ephemeral=True)
+            return
 
         await interaction.response.defer()
+        channel = interaction.channel
         session_factory = get_session_factory()
         async with session_factory() as session:
             service = BearService(session)
@@ -278,9 +292,19 @@ def register(bot: commands.Bot, settings: Settings) -> None:
 
         text = "\n\n".join(blocks)
         chunks = split_discord_messages(text)
-        await interaction.followup.send(chunks[0] if chunks else "Медвежий тирлист пока пуст.")
+        previous_message_ids = last_tierlist_message_ids.pop(interaction.channel_id, [])
+        await delete_messages_by_ids(channel, previous_message_ids)
+
+        sent_messages: list[int] = []
+        first_message = await interaction.followup.send(
+            chunks[0] if chunks else "Медвежий тирлист пока пуст.",
+            wait=True,
+        )
+        sent_messages.append(first_message.id)
         for chunk in chunks[1:]:
-            await interaction.channel.send(chunk)
+            message = await channel.send(chunk)
+            sent_messages.append(message.id)
+        last_tierlist_message_ids[interaction.channel_id] = sent_messages
 
     @bot.tree.command(name="bear_duel", description="Вызвать другого медведя на дуэль")
     @app_commands.describe(player="Медведь, которого ты вызываешь")
