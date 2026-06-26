@@ -10,6 +10,7 @@ from bot.models.bear import BearMatch
 from bot.models.enums import BearChallengeStatus
 from bot.models.user import User
 from bot.services.bear_service import BEAR_ROLE_ID, BearService
+from bot.services.draft_service import is_admin
 
 
 BEAR_CHANNEL_ID = 1519833399085236304
@@ -26,7 +27,7 @@ PLACE_EMOJIS = {
     2: "🥈",
     3: "🥉",
 }
-last_tierlist_message_ids: dict[int, list[int]] = {}
+bear_tierlist_message_id: int | None = None
 
 
 class AcceptChallengeView(discord.ui.View):
@@ -155,6 +156,81 @@ def split_discord_messages(text: str, limit: int = 1900) -> list[str]:
     return chunks
 
 
+def render_bear_tierlist(tierlist: list[tuple[object, list[User]]]) -> str:
+    blocks: list[str] = ["# 🐻 Медвежий тирлист"]
+    for tier, users in tierlist:
+        emoji = TIER_EMOJIS.get(tier.name, "🐾")
+        limit_text = f" · {len(users)}/{tier.slots}" if tier.is_capped and tier.slots is not None else ""
+        lines = [f"## {emoji} {tier.name}{limit_text}"]
+        if users:
+            lines.extend(
+                f"{place_label(index)} {bear_player_name(user)}"
+                for index, user in enumerate(users, start=1)
+            )
+        else:
+            lines.append("_Пока пусто_")
+        blocks.append("\n".join(lines))
+
+    text = "\n\n".join(blocks)
+    if len(text) <= 1900:
+        return text
+    return f"{text[:1850]}\n\n_Список слишком длинный, показана первая часть._"
+
+
+async def build_bear_tierlist_text() -> str:
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        service = BearService(session)
+        return render_bear_tierlist(await service.tierlist())
+
+
+async def find_existing_tierlist_message(channel: discord.TextChannel, bot_user: discord.ClientUser | None) -> discord.Message | None:
+    if bot_user is None:
+        return None
+    async for message in channel.history(limit=50):
+        if message.author.id == bot_user.id and message.content.startswith("# 🐻 Медвежий тирлист"):
+            return message
+    return None
+
+
+async def upsert_bear_tierlist_message(bot: commands.Bot, channel: discord.TextChannel) -> discord.Message:
+    global bear_tierlist_message_id
+    text = await build_bear_tierlist_text()
+    message: discord.Message | None = None
+    if bear_tierlist_message_id is not None:
+        try:
+            message = await channel.fetch_message(bear_tierlist_message_id)
+        except (discord.Forbidden, discord.NotFound):
+            message = None
+    if message is None:
+        message = await find_existing_tierlist_message(channel, bot.user)
+    if message is None:
+        message = await channel.send(text)
+    else:
+        await message.edit(content=text)
+    bear_tierlist_message_id = message.id
+    return message
+
+
+async def refresh_bear_tierlist_message(bot: commands.Bot) -> None:
+    channel = bot.get_channel(BEAR_TIERLIST_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(BEAR_TIERLIST_CHANNEL_ID)
+        except (discord.Forbidden, discord.NotFound):
+            return
+    if not isinstance(channel, discord.TextChannel):
+        return
+    if bear_tierlist_message_id is None:
+        existing = await find_existing_tierlist_message(channel, bot.user)
+        if existing is None:
+            return
+    try:
+        await upsert_bear_tierlist_message(bot, channel)
+    except discord.Forbidden:
+        return
+
+
 async def ask_acceptance(channel: discord.abc.Messageable, challenger: discord.Member, opponent: discord.Member, title: str) -> bool:
     view = AcceptChallengeView(opponent.id)
     try:
@@ -247,17 +323,22 @@ def register(bot: commands.Bot, settings: Settings) -> None:
                     "Ты добавлен в медвежий ладдер, но у бота нет прав выдать роль.",
                     ephemeral=True,
                 )
+                await refresh_bear_tierlist_message(bot)
                 return
 
         await interaction.response.send_message(
             f"Добро пожаловать в медвежий ладдер. Стартовый тир: Медвежата, место #{user.tier_placement}.",
             ephemeral=True,
         )
+        await refresh_bear_tierlist_message(bot)
 
     @bot.tree.command(name="bear_tierlist", description="Показать медвежий тирлист")
     async def bear_tierlist(interaction: discord.Interaction) -> None:
         if not is_database_configured():
             await interaction.response.send_message("База данных не настроена.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+            await interaction.response.send_message("Только админ бота может обновить сообщение тирлиста.", ephemeral=True)
             return
         if not is_bear_tierlist_channel(interaction):
             await interaction.response.send_message(
@@ -270,41 +351,11 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             return
 
         await interaction.response.defer()
-        channel = interaction.channel
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            service = BearService(session)
-            tierlist = await service.tierlist()
-
-        blocks: list[str] = ["# 🐻 Медвежий тирлист"]
-        for tier, users in tierlist:
-            emoji = TIER_EMOJIS.get(tier.name, "🐾")
-            limit_text = f" · {len(users)}/{tier.slots}" if tier.is_capped and tier.slots is not None else ""
-            lines = [f"## {emoji} {tier.name}{limit_text}"]
-            if users:
-                lines.extend(
-                    f"{place_label(index)} {bear_player_name(user)}"
-                    for index, user in enumerate(users, start=1)
-                )
-            else:
-                lines.append("_Пока пусто_")
-            blocks.append("\n".join(lines))
-
-        text = "\n\n".join(blocks)
-        chunks = split_discord_messages(text)
-        previous_message_ids = last_tierlist_message_ids.pop(interaction.channel_id, [])
-        await delete_messages_by_ids(channel, previous_message_ids)
-
-        sent_messages: list[int] = []
-        first_message = await interaction.followup.send(
-            chunks[0] if chunks else "Медвежий тирлист пока пуст.",
-            wait=True,
-        )
-        sent_messages.append(first_message.id)
-        for chunk in chunks[1:]:
-            message = await channel.send(chunk)
-            sent_messages.append(message.id)
-        last_tierlist_message_ids[interaction.channel_id] = sent_messages
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.followup.send("Тирлист можно создать только в текстовом канале.", ephemeral=True)
+            return
+        await upsert_bear_tierlist_message(bot, interaction.channel)
+        await interaction.followup.send("Сообщение медвежьего тирлиста обновлено.", ephemeral=True)
 
     @bot.tree.command(name="bear_duel", description="Вызвать другого медведя на дуэль")
     @app_commands.describe(player="Медведь, которого ты вызываешь")
@@ -454,6 +505,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             loser_user = opponent_user if winner_user.id == challenger_user.id else challenger_user
             await service.finish_challenge(challenge, winner_user, loser_user, player1_wins, player2_wins)
 
+        await refresh_bear_tierlist_message(bot)
         total_score = personal_score_text(bear_match, challenger_user, opponent_user) if bear_match is not None else "0:0"
         await interaction.followup.send(
             f"Медвежий challenge завершен.\n"

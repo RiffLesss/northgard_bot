@@ -2,12 +2,11 @@ import unittest
 
 from bot.services.team3_service import (
     NORMAL_RATING_SPREAD,
-    CasualGroup,
     QueueEntry,
     TEAM3_DRAFT_STEPS,
     find_best_ranked_match,
     rating_delta,
-    split_casual_groups,
+    split_casual_players,
 )
 
 
@@ -36,18 +35,14 @@ class Team3ServiceTest(unittest.TestCase):
             find_best_ranked_match([self.entry(i, rating, wide=True) for i, rating in enumerate(ratings)])
         )
 
-    def test_casual_split_keeps_groups_together(self) -> None:
-        groups = [
-            CasualGroup((DummyUser(1), DummyUser(2))),
-            CasualGroup((DummyUser(3),)),
-            CasualGroup((DummyUser(4), DummyUser(5), DummyUser(6))),
-        ]
+    def test_casual_split_randomizes_six_solo_players(self) -> None:
+        users = [DummyUser(index) for index in range(1, 7)]
 
-        team_a, team_b = split_casual_groups(groups)  # type: ignore[arg-type]
-        teams = [{user.id for user in team_a}, {user.id for user in team_b}]
+        team_a, team_b = split_casual_players(users)  # type: ignore[arg-type]
 
-        self.assertIn({4, 5, 6}, teams)
-        self.assertIn({1, 2, 3}, teams)
+        self.assertEqual(3, len(team_a))
+        self.assertEqual(3, len(team_b))
+        self.assertEqual({1, 2, 3, 4, 5, 6}, {user.id for user in [*team_a, *team_b]})
 
     def test_team3_draft_has_expected_steps(self) -> None:
         self.assertEqual(14, len(TEAM3_DRAFT_STEPS))

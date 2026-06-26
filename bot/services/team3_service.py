@@ -62,11 +62,6 @@ class TeamSplit:
 
 
 @dataclass(frozen=True)
-class CasualGroup:
-    users: tuple[User, ...]
-
-
-@dataclass(frozen=True)
 class CreatedTeam3Match:
     match: Match
     team1: Team
@@ -130,23 +125,12 @@ def best_team_split(entries: tuple[QueueEntry, ...]) -> TeamSplit:
     return best
 
 
-def split_casual_groups(groups: list[CasualGroup]) -> tuple[list[User], list[User]]:
-    shuffled = groups.copy()
+def split_casual_players(users: list[User]) -> tuple[list[User], list[User]]:
+    if len(users) != 6:
+        raise ValueError("Casual match needs exactly 6 players")
+    shuffled = users.copy()
     random.shuffle(shuffled)
-    team_a: list[User] = []
-    team_b: list[User] = []
-    for group in sorted(shuffled, key=lambda item: len(item.users), reverse=True):
-        if len(team_a) <= len(team_b) and len(team_a) + len(group.users) <= 3:
-            team_a.extend(group.users)
-        elif len(team_b) + len(group.users) <= 3:
-            team_b.extend(group.users)
-        elif len(team_a) + len(group.users) <= 3:
-            team_a.extend(group.users)
-        else:
-            raise ValueError("Cannot split casual groups into two teams")
-    if len(team_a) != 3 or len(team_b) != 3:
-        raise ValueError("Casual match needs exactly 3 players per team")
-    return team_a, team_b
+    return shuffled[:3], shuffled[3:]
 
 
 def expected_score(team_rating: float, opponent_rating: float) -> float:
