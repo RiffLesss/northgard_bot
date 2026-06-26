@@ -1,29 +1,23 @@
 # Northgard Discord Bot
 
-Discord-бот для Northgard:
+Discord bot for Northgard drafts, registration, PostgreSQL-backed data, and the Bear Ladder.
 
-- `/shuffle_teams` генерирует расписание раундов и команд;
-- `/start_draft_2v2` запускает ban-pick 2v2;
-- `/stop_draft_2v2` останавливает текущий драфт;
-- `/restart_draft_2v2` перезапускает драфт текущей игры;
-- `/add_admin` добавляет администратора бота.
-
-## Структура
+## Structure
 
 ```text
-northgard_bot/
-  __main__.py      # запуск через python -m northgard_bot
-  bot.py           # Discord commands/events
-  config.py        # переменные окружения
-  draft.py         # ban-pick логика и Discord UI
-  schedule.py      # генерация расписания
-tests/             # тесты чистой логики
-data/              # runtime-состояние, не коммитится
+bot/
+  main.py              # bot setup and cog registration
+  run.py               # startup entrypoint, optional test run
+  cogs/                # Discord slash commands
+  services/            # business logic
+  repositories/        # database access
+  models/              # SQLAlchemy models
+  database/            # engine/session setup
+alembic/               # database migrations
+tests/                 # unit tests
 ```
 
-Старые файлы `discord_bot.py`, `draft_northgard_script.py` и `random_teams_northgard_script.py` оставлены как совместимые обертки.
-
-## Локальный запуск
+## Local Setup
 
 ```powershell
 python -m venv .venv
@@ -31,46 +25,48 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Создайте `.env` на основе `.env.example` или задайте переменные в PowerShell:
+Create `.env` from `.env.example` and set at least:
 
-```powershell
-$env:DISCORD_BOT_TOKEN="your_token"
-$env:DISCORD_GUILD_ID="123456789012345678"
-$env:ALLOWED_CHANNEL_ID="1481764374569025671"
-python -m northgard_bot
+```env
+DISCORD_BOT_TOKEN=your_token
+DISCORD_GUILD_ID=your_guild_id
+DATABASE_URL=postgresql://northgard_bot:northgard_bot_pass@postgres:5432/northgard_bot
 ```
 
-`DISCORD_BOT_TOKEN` обязателен. Остальные переменные опциональны:
+Local run without Docker:
 
-- `DISCORD_GUILD_ID` ускоряет синхронизацию slash-команд на одном сервере;
-- `ALLOWED_CHANNEL_ID` ограничивает `/shuffle_teams` одним каналом;
-- `BOT_ADMINS_FILE` задает путь к JSON-файлу админов, по умолчанию `data/bot_admins.json`.
+```powershell
+python -m bot.run
+```
 
 ## Docker
+
+Start bot and PostgreSQL:
 
 ```powershell
 docker compose up -d --build
 ```
 
-Compose монтирует volume `bot_data` в `/app/data`, поэтому список админов сохраняется между перезапусками контейнера.
-
-## Проверки
+Apply migrations:
 
 ```powershell
-python -m py_compile discord_bot.py draft_northgard_script.py random_teams_northgard_script.py northgard_bot\*.py
+docker compose run --rm --no-deps bot alembic upgrade head
+```
+
+## Tests
+
+```powershell
+python -m pytest
+```
+
+or:
+
+```powershell
 python -m unittest discover -s tests
 ```
 
-## Database migrations
+To run tests automatically before bot startup, set:
 
-PostgreSQL schema is managed by Alembic.
-
-```powershell
-alembic upgrade head
-```
-
-With Docker:
-
-```powershell
-docker compose run --rm bot alembic upgrade head
+```env
+RUN_TESTS_ON_STARTUP=true
 ```
