@@ -28,6 +28,7 @@ MENTION_RE = re.compile(r"<@!?(\d+)>")
 ranked_queue: dict[int, QueueEntry] = {}
 casual_lobbies: dict[int, list[tuple[int, ...]]] = {}
 pending_ready_checks: set[int] = set()
+team3_panel_messages: dict[int, int] = {}
 
 
 @dataclass
@@ -53,6 +54,42 @@ def member_names(members: list[discord.Member]) -> str:
 
 def team_mentions(members: list[discord.Member]) -> str:
     return " ".join(member.mention for member in members)
+
+
+def casual_lobby_count(channel_id: int) -> int:
+    return sum(len(group) for group in casual_lobbies.get(channel_id, []))
+
+
+def ranked_queue_count() -> int:
+    return len(ranked_queue)
+
+
+def ranked_wide_count() -> int:
+    return sum(1 for entry in ranked_queue.values() if entry.wide)
+
+
+def render_team3_panel(channel_id: int) -> str:
+    return (
+        "# Northgard 3v3\n"
+        "Выбери режим кнопкой ниже.\n\n"
+        f"**Обычная 3v3:** {casual_lobby_count(channel_id)}/6 в lobby\n"
+        f"**Ranked 3v3:** {ranked_queue_count()} в очереди\n"
+        f"**Ranked wide:** {ranked_wide_count()} в wide-поиске\n\n"
+        "**Обычная 3v3** - lobby на 6 игроков, можно зайти solo/party до 3 человек.\n"
+        "**Ranked 3v3** - поиск с ограничением рейтинга.\n"
+        "**Ranked wide** - поиск с высоким разбросом рейтинга."
+    )
+
+
+async def update_team3_panel(channel: discord.abc.Messageable, channel_id: int) -> None:
+    message_id = team3_panel_messages.get(channel_id)
+    if message_id is None:
+        return
+    try:
+        message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+        await message.edit(content=render_team3_panel(channel_id), view=Team3PanelView())
+    except (AttributeError, discord.Forbidden, discord.NotFound):
+        team3_panel_messages.pop(channel_id, None)
 
 
 def missing_voice_members(members: list[discord.Member]) -> list[discord.Member]:
@@ -133,6 +170,42 @@ async def create_match_text_channel(guild: discord.Guild, context: Team3MatchCon
     )
     context.text_channel = channel
     return channel
+
+
+async def create_ready_text_channel(
+    guild: discord.Guild,
+    members: list[discord.Member],
+    source_channel: discord.abc.GuildChannel,
+    title: str,
+) -> discord.TextChannel:
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+    }
+    for member in members:
+        overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    category = source_channel.category if isinstance(source_channel, discord.abc.GuildChannel) else None
+    safe_title = title.lower().replace(" ", "-")
+    return await guild.create_text_channel(
+        name=f"{safe_title}-ready",
+        overwrites=overwrites,
+        category=category,
+        reason="3v3 match ready-check channel",
+    )
+
+
+async def rename_match_text_channel(channel: discord.TextChannel, match_id: int) -> None:
+    try:
+        await channel.edit(name=f"3v3-match-{match_id}", reason="3v3 match created")
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+
+async def delete_channel(channel: discord.abc.GuildChannel) -> None:
+    try:
+        await channel.delete(reason="3v3 match cancelled")
+    except (discord.Forbidden, discord.NotFound):
+        pass
 
 
 async def create_casual_voice_channels(guild: discord.Guild, context: Team3MatchContext, source_channel: discord.abc.GuildChannel) -> None:
@@ -520,6 +593,7 @@ class CasualPartyModal(discord.ui.Modal, title="Зайти группой"):
             return
         lobby.append(unique_ids)
         await interaction.response.send_message(f"Группа добавлена в casual 3v3 lobby: {len(unique_ids)} игрок(а).", ephemeral=True)
+        await update_team3_panel(interaction.channel, interaction.channel_id)
         await maybe_start_casual_match(interaction)
 
 
@@ -546,6 +620,8 @@ class Team3PanelView(discord.ui.View):
             casual_lobbies[interaction.channel_id] = [
                 group for group in casual_lobbies.get(interaction.channel_id, []) if interaction.user.id not in group
             ]
+        if interaction.channel is not None and interaction.channel_id is not None:
+            await update_team3_panel(interaction.channel, interaction.channel_id)
         await interaction.response.send_message("Ты вышел из очереди/lobby.", ephemeral=True)
 
 
@@ -573,6 +649,7 @@ async def join_ranked_queue(interaction: discord.Interaction, wide: bool) -> Non
     )
     mode = "wide" if wide else "normal"
     await interaction.response.send_message(f"Ты в ranked 3v3 queue. Режим: {mode}.", ephemeral=True)
+    await update_team3_panel(interaction.channel, interaction.channel.id)
     await maybe_start_ranked_match(interaction)
 
 
@@ -595,14 +672,22 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
     if missing_voice:
         for member in missing_voice:
             ranked_queue.pop(member.id, None)
+        await update_team3_panel(interaction.channel, interaction.channel.id)
         await interaction.channel.send(
             "Матч найден, но не все игроки находятся в голосовом канале. "
             f"Игроки удалены из очереди: {team_mentions(missing_voice)}"
         )
         return
 
+    try:
+        ready_channel = await create_ready_text_channel(interaction.guild, members, interaction.channel, "ranked-3v3")
+        await interaction.channel.send(f"Ranked 3v3 найден. Ready-check: {ready_channel.mention}")
+    except discord.Forbidden:
+        ready_channel = interaction.channel
+        await interaction.channel.send("У бота нет прав создать ready-check канал. Ready-check будет здесь.")
+
     pending_ready_checks.add(interaction.channel.id)
-    ready_check = await run_ready_check(interaction.channel, members, "Ranked 3v3")
+    ready_check = await run_ready_check(ready_channel, members, "Ranked 3v3")
     pending_ready_checks.discard(interaction.channel.id)
     if not ready_check.accepted():
         ready_ids = {member.id for member in members}
@@ -612,10 +697,14 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         )
         for discord_id in declined_or_missing:
             ranked_queue.pop(discord_id, None)
+        await update_team3_panel(interaction.channel, interaction.channel.id)
+        if isinstance(ready_channel, discord.TextChannel):
+            await delete_channel(ready_channel)
         return
 
     for entry in [*split.team_a, *split.team_b]:
         ranked_queue.pop(entry.discord_id, None)
+    await update_team3_panel(interaction.channel, interaction.channel.id)
 
     context = await build_context(
         interaction.guild,
@@ -623,6 +712,9 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         [member for member in team2_members if member is not None],
         GameMode.RANKED,
     )
+    if isinstance(ready_channel, discord.TextChannel):
+        context.text_channel = ready_channel
+        await rename_match_text_channel(ready_channel, context.match_id)
     try:
         await create_ranked_resources(interaction.guild, context)
         await move_match_members(context)
@@ -630,11 +722,7 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         await interaction.channel.send(
             "Матч создан, но у бота нет прав создать роли/голосовые каналы или переместить игроков."
         )
-    try:
-        draft_channel = await create_match_text_channel(interaction.guild, context, interaction.channel)
-    except discord.Forbidden:
-        draft_channel = interaction.channel
-        await interaction.channel.send("У бота нет прав создать отдельный draft-канал. Драфт будет здесь.")
+    draft_channel = context.text_channel or interaction.channel
 
     await interaction.channel.send(
         f"Ranked 3v3 найден. Match #{context.match_id}\n"
@@ -653,7 +741,7 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         return
     lobby = casual_lobbies.get(interaction.channel_id, [])
     if sum(len(group) for group in lobby) < 6:
-        await interaction.channel.send(f"Casual 3v3 lobby: {sum(len(group) for group in lobby)}/6")
+        await update_team3_panel(interaction.channel, interaction.channel_id)
         return
     if sum(len(group) for group in lobby) > 6:
         return
@@ -677,24 +765,35 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
     if missing_voice:
         remove_users_from_lobby(interaction.channel_id, {member.id for member in missing_voice})
         remaining_count = sum(len(group) for group in casual_lobbies.get(interaction.channel_id, []))
+        await update_team3_panel(interaction.channel, interaction.channel_id)
         await interaction.channel.send(
             "Матч найден, но не все игроки находятся в голосовом канале. "
             f"Игроки удалены из lobby: {team_mentions(missing_voice)}. Осталось: {remaining_count}/6."
         )
         return
 
+    try:
+        ready_channel = await create_ready_text_channel(interaction.guild, members, interaction.channel, "casual-3v3")
+        await interaction.channel.send(f"Casual 3v3 найден. Ready-check: {ready_channel.mention}")
+    except discord.Forbidden:
+        ready_channel = interaction.channel
+        await interaction.channel.send("У бота нет прав создать ready-check канал. Ready-check будет здесь.")
+
     pending_ready_checks.add(interaction.channel_id)
-    ready_check = await run_ready_check(interaction.channel, members, "Casual 3v3")
+    ready_check = await run_ready_check(ready_channel, members, "Casual 3v3")
     pending_ready_checks.discard(interaction.channel_id)
     if not ready_check.accepted():
         ready_ids = {member.id for member in members}
         declined_or_missing = ready_ids - ready_check.accepted_ids
         remove_users_from_lobby(interaction.channel_id, declined_or_missing)
         remaining_count = sum(len(group) for group in casual_lobbies.get(interaction.channel_id, []))
+        await update_team3_panel(interaction.channel, interaction.channel_id)
         await interaction.channel.send(
             "Ready-check не принят всеми игроками. "
             f"Принявшие игроки остаются в lobby: {remaining_count}/6."
         )
+        if isinstance(ready_channel, discord.TextChannel):
+            await delete_channel(ready_channel)
         return
 
     context = await build_context(
@@ -703,7 +802,11 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         [member for member in team2_members if member is not None],
         GameMode.CASUAL,
     )
+    if isinstance(ready_channel, discord.TextChannel):
+        context.text_channel = ready_channel
+        await rename_match_text_channel(ready_channel, context.match_id)
     clear_lobby(interaction.channel_id)
+    await update_team3_panel(interaction.channel, interaction.channel_id)
     try:
         await create_casual_voice_channels(interaction.guild, context, interaction.channel)
         await move_match_members(context)
@@ -711,11 +814,7 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await interaction.channel.send(
             "Матч создан, но у бота нет прав создать голосовые каналы или переместить игроков."
         )
-    try:
-        draft_channel = await create_match_text_channel(interaction.guild, context, interaction.channel)
-    except discord.Forbidden:
-        draft_channel = interaction.channel
-        await interaction.channel.send("У бота нет прав создать отдельный draft-канал. Драфт будет здесь.")
+    draft_channel = context.text_channel or interaction.channel
 
     await interaction.channel.send(
         f"Casual 3v3 собран. Match #{context.match_id}\n"
@@ -730,14 +829,12 @@ def register(bot: commands.Bot, settings: Settings) -> None:
     @bot.tree.command(name="team3_panel", description="Панель 3v3 матчей")
     @app_commands.default_permissions(manage_guild=True)
     async def team3_panel(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            "# Northgard 3v3\n"
-            "Выбери режим кнопкой ниже.\n\n"
-            "**Обычная 3v3** - lobby на 6 игроков, можно зайти solo/party до 3 человек.\n"
-            "**Ranked 3v3** - поиск с ограничением рейтинга.\n"
-            "**Ranked wide** - поиск с высоким разбросом рейтинга.",
-            view=Team3PanelView(),
-        )
+        if interaction.channel_id is None:
+            await interaction.response.send_message("Не удалось определить канал.", ephemeral=True)
+            return
+        await interaction.response.send_message(render_team3_panel(interaction.channel_id), view=Team3PanelView())
+        message = await interaction.original_response()
+        team3_panel_messages[interaction.channel_id] = message.id
 
     @bot.tree.command(name="tournament_3v3_start", description="Запустить турнирный 3v3 draft")
     @app_commands.describe(
