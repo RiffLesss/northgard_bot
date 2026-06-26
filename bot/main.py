@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 
-from bot.cogs import admin, bear, draft, matchmaking, registration
+from bot.cogs import admin, bear, draft, matchmaking, registration, team3
 from bot.config import Settings, load_settings
 from bot.database.session import init_database
 from bot.services.draft_service import configure_admins_file, load_bot_admins
@@ -17,6 +17,7 @@ def create_bot(settings: Settings) -> commands.Bot:
     draft.register(bot, settings)
     matchmaking.register(bot, settings)
     registration.register(bot, settings)
+    team3.register(bot, settings)
 
     @bot.event
     async def on_ready() -> None:
