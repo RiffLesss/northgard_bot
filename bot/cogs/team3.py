@@ -13,8 +13,6 @@ from bot.models.enums import BestOf, DraftActionType, GameMode, PickType
 from bot.models.user import User
 from bot.services.draft_service import is_admin
 from bot.services.team3_service import (
-    CLEAR_CLANS,
-    ECO_CLANS,
     TEAM3_DRAFT_STEPS,
     QueueEntry,
     Team3DraftStep,
@@ -54,6 +52,8 @@ class Team3MatchContext:
     game_number: int = 1
     team1_score: int = 0
     team2_score: int = 0
+    clear_clans: list[str] | None = None
+    eco_clans: list[str] | None = None
 
 
 def member_names(members: list[discord.Member]) -> str:
@@ -326,7 +326,9 @@ class Team3DraftView(discord.ui.View):
         return self.context.team2_id if side == "A" else self.context.team1_id
 
     def clan_pool(self, pick_type: PickType) -> list[str]:
-        source = CLEAR_CLANS if pick_type == PickType.CLEAR else ECO_CLANS
+        source = self.context.clear_clans if pick_type == PickType.CLEAR else self.context.eco_clans
+        if source is None:
+            source = []
         return [clan for clan in source if clan not in self.bans]
 
     def available_options(self, step: Team3DraftStep) -> list[str]:
@@ -334,7 +336,8 @@ class Team3DraftView(discord.ui.View):
         if step.action_type == DraftActionType.PICK:
             options = [clan for clan in options if clan not in self.picks[step.side]]
             if step.pick_type == PickType.CLEAR:
-                options = [clan for clan in options if not any(pick in CLEAR_CLANS for pick in self.picks[step.side])]
+                clear_clans = set(self.context.clear_clans or [])
+                options = [clan for clan in options if not any(pick in clear_clans for pick in self.picks[step.side])]
         return options
 
     def refresh_items(self) -> None:
@@ -801,6 +804,7 @@ async def build_context(
             game_mode,
             best_of,
         )
+        clear_clans, eco_clans = await service.get_clan_pools()
     return Team3MatchContext(
         match_id=created.match.id,
         team1_id=created.team1.id,
@@ -811,6 +815,8 @@ async def build_context(
         team2_user_ids=[user.id for user in team2_users],
         game_mode=game_mode,
         best_of=best_of,
+        clear_clans=clear_clans,
+        eco_clans=eco_clans,
     )
 
 
@@ -909,7 +915,12 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         return
     if interaction.channel.id in pending_ready_checks:
         return
-    split = find_best_ranked_match(list(ranked_queue.values()))
+    queue_entries = list(ranked_queue.values())
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        service = Team3Service(session)
+        blacklist_pairs = await service.get_blacklist_pairs([entry.user_id for entry in queue_entries])
+    split = find_best_ranked_match(queue_entries, blacklist_pairs)
     if split is None:
         return
 
@@ -1008,7 +1019,16 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         for group in lobby:
             for discord_id in group:
                 users.append(await service.get_registered_user(discord_id))
-    team1_users, team2_users = split_casual_players(users)
+        blacklist_pairs = await service.get_blacklist_pairs([user.id for user in users])
+    try:
+        team1_users, team2_users = split_casual_players(users, blacklist_pairs)
+    except ValueError:
+        await update_team3_panel(interaction.channel, interaction.channel_id)
+        await interaction.channel.send(
+            "Casual lobby заполнено, но невозможно собрать две команды без blacklist-конфликтов. "
+            "Кому-то нужно выйти из lobby или изменить blacklist."
+        )
+        return
     team1_members = [await fetch_member(interaction.guild, user.discord_id) for user in team1_users]
     team2_members = [await fetch_member(interaction.guild, user.discord_id) for user in team2_users]
     if any(member is None for member in [*team1_members, *team2_members]):

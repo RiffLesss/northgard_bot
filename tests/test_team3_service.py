@@ -44,6 +44,31 @@ class Team3ServiceTest(unittest.TestCase):
         self.assertEqual(3, len(team_b))
         self.assertEqual({1, 2, 3, 4, 5, 6}, {user.id for user in [*team_a, *team_b]})
 
+    def test_ranked_split_avoids_blacklist_conflicts_inside_team(self) -> None:
+        entries = [self.entry(index, 500) for index in range(1, 7)]
+
+        split = find_best_ranked_match(entries, {(1, 2)})
+
+        self.assertIsNotNone(split)
+        assert split is not None
+        teams = [{entry.user_id for entry in split.team_a}, {entry.user_id for entry in split.team_b}]
+        self.assertFalse(any({1, 2}.issubset(team) for team in teams))
+
+    def test_casual_split_avoids_blacklist_conflicts_inside_team(self) -> None:
+        users = [DummyUser(index) for index in range(1, 7)]
+
+        team_a, team_b = split_casual_players(users, {(1, 2)}, attempts=1)  # type: ignore[arg-type]
+
+        teams = [{user.id for user in team_a}, {user.id for user in team_b}]
+        self.assertFalse(any({1, 2}.issubset(team) for team in teams))
+
+    def test_casual_split_fails_when_blacklist_safe_split_is_impossible(self) -> None:
+        users = [DummyUser(index) for index in range(1, 7)]
+        blacklist_pairs = {(left, right) for left in range(1, 7) for right in range(1, 7) if left != right}
+
+        with self.assertRaises(ValueError):
+            split_casual_players(users, blacklist_pairs, attempts=1)  # type: ignore[arg-type]
+
     def test_team3_draft_has_expected_steps(self) -> None:
         self.assertEqual(14, len(TEAM3_DRAFT_STEPS))
         first_step = TEAM3_DRAFT_STEPS[0]

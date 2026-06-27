@@ -9,39 +9,23 @@ from bot.models.enums import BestOf, DraftActionType, GameMode, MatchFormat, Pic
 from bot.models.match import Match
 from bot.models.team import Team
 from bot.models.user import User
+from bot.services.draft_service import ALL_CLANS as DEFAULT_ALL_CLANS
+from bot.services.draft_service import CLEAR_CLANS as DEFAULT_CLEAR_CLANS
 from bot.repositories.clan_repository import ClanRepository
 from bot.repositories.draft_action_repository import DraftActionRepository
+from bot.repositories.blacklist_repository import BlacklistRepository
 from bot.repositories.match_repository import MatchRepository
 from bot.repositories.team_repository import TeamRepository
 from bot.repositories.user_repository import UserRepository
 
 
-CLEAR_CLANS = ["Wolf", "Lynx", "Eagle", "Hound"]
-ALL_CLANS = [
-    "Stag",
-    "Goat",
-    "Wolf",
-    "Bear",
-    "Boar",
-    "Snake",
-    "Dragon",
-    "Horse",
-    "Kraken",
-    "Ox",
-    "Lynx",
-    "Squirrel",
-    "Rat",
-    "Eagle",
-    "Lion",
-    "Stoat",
-    "Owl",
-    "Hound",
-    "Turtle",
-    "Hippo",
-]
+CLEAR_CLANS = [clan for clan in DEFAULT_ALL_CLANS if clan in DEFAULT_CLEAR_CLANS]
+ALL_CLANS = DEFAULT_ALL_CLANS
 ECO_CLANS = [clan for clan in ALL_CLANS if clan not in CLEAR_CLANS]
 NORMAL_RATING_SPREAD = 300
 K_FACTOR = 32
+CASUAL_SPLIT_ATTEMPTS = 100
+BlacklistPairs = set[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -93,10 +77,11 @@ TEAM3_DRAFT_STEPS = [
 ]
 
 
-def find_best_ranked_match(entries: list[QueueEntry]) -> TeamSplit | None:
+def find_best_ranked_match(entries: list[QueueEntry], blacklist_pairs: BlacklistPairs | None = None) -> TeamSplit | None:
     if len(entries) < 6:
         return None
 
+    blacklist_pairs = blacklist_pairs or set()
     best: TeamSplit | None = None
     for six in itertools.combinations(entries, 6):
         ratings = [entry.rating for entry in six]
@@ -104,33 +89,79 @@ def find_best_ranked_match(entries: list[QueueEntry]) -> TeamSplit | None:
         is_wide_match = all(entry.wide for entry in six)
         if not is_normal_match and not is_wide_match:
             continue
-        split = best_team_split(six)
+        split = best_team_split(six, blacklist_pairs)
+        if split is None:
+            continue
         if best is None or split.rating_diff < best.rating_diff:
             best = split
     return best
 
 
-def best_team_split(entries: tuple[QueueEntry, ...]) -> TeamSplit:
+def best_team_split(entries: tuple[QueueEntry, ...], blacklist_pairs: BlacklistPairs | None = None) -> TeamSplit | None:
+    blacklist_pairs = blacklist_pairs or set()
     first = entries[0]
     best: TeamSplit | None = None
     for combo in itertools.combinations(entries[1:], 2):
         team_a = (first, *combo)
         team_b = tuple(entry for entry in entries if entry not in team_a)
+        if not teams_are_blacklist_safe(
+            [entry.user_id for entry in team_a],
+            [entry.user_id for entry in team_b],
+            blacklist_pairs,
+        ):
+            continue
         diff = abs(sum(entry.rating for entry in team_a) - sum(entry.rating for entry in team_b))
         split = TeamSplit(team_a=team_a, team_b=team_b, rating_diff=diff)  # type: ignore[arg-type]
         if best is None or diff < best.rating_diff:
             best = split
-    if best is None:
-        raise ValueError("Need exactly 6 entries")
     return best
 
 
-def split_casual_players(users: list[User]) -> tuple[list[User], list[User]]:
+def team_has_blacklist_conflict(user_ids: list[int], blacklist_pairs: BlacklistPairs) -> bool:
+    user_id_set = set(user_ids)
+    return any(player_id in user_id_set and blacklisted_id in user_id_set for player_id, blacklisted_id in blacklist_pairs)
+
+
+def teams_are_blacklist_safe(team_a_user_ids: list[int], team_b_user_ids: list[int], blacklist_pairs: BlacklistPairs) -> bool:
+    return not team_has_blacklist_conflict(team_a_user_ids, blacklist_pairs) and not team_has_blacklist_conflict(
+        team_b_user_ids,
+        blacklist_pairs,
+    )
+
+
+def split_casual_players(
+    users: list[User],
+    blacklist_pairs: BlacklistPairs | None = None,
+    attempts: int = CASUAL_SPLIT_ATTEMPTS,
+) -> tuple[list[User], list[User]]:
     if len(users) != 6:
         raise ValueError("Casual match needs exactly 6 players")
+    blacklist_pairs = blacklist_pairs or set()
+    for _ in range(attempts):
+        shuffled = users.copy()
+        random.shuffle(shuffled)
+        team_a = shuffled[:3]
+        team_b = shuffled[3:]
+        if teams_are_blacklist_safe(
+            [user.id for user in team_a],
+            [user.id for user in team_b],
+            blacklist_pairs,
+        ):
+            return team_a, team_b
+
     shuffled = users.copy()
     random.shuffle(shuffled)
-    return shuffled[:3], shuffled[3:]
+    for combo in itertools.combinations(shuffled, 3):
+        team_a = list(combo)
+        team_b = [user for user in shuffled if user not in team_a]
+        if teams_are_blacklist_safe(
+            [user.id for user in team_a],
+            [user.id for user in team_b],
+            blacklist_pairs,
+        ):
+            return team_a, team_b
+
+    raise ValueError("Cannot split casual players without blacklist conflicts")
 
 
 def expected_score(team_rating: float, opponent_rating: float) -> float:
@@ -150,12 +181,25 @@ class Team3Service:
         self.matches = MatchRepository(session)
         self.clans = ClanRepository(session)
         self.draft_actions = DraftActionRepository(session)
+        self.blacklist = BlacklistRepository(session)
 
     async def get_registered_user(self, discord_id: int) -> User:
         user = await self.users.get_by_discord_id(discord_id)
         if user is None:
             raise ValueError("Сначала нужно зарегистрироваться через /register.")
         return user
+
+    async def get_blacklist_pairs(self, user_ids: list[int]) -> BlacklistPairs:
+        return await self.blacklist.list_pairs_for_players(user_ids)
+
+    async def get_clan_pools(self) -> tuple[list[str], list[str]]:
+        all_clans = await self.clans.enabled_names()
+        clear_clans = await self.clans.clear_names()
+        if not all_clans or not clear_clans:
+            return CLEAR_CLANS, ECO_CLANS
+        clear_set = set(clear_clans)
+        eco_clans = [clan for clan in all_clans if clan not in clear_set]
+        return clear_clans, eco_clans
 
     async def create_match(
         self,

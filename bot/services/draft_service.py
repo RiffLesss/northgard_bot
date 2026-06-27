@@ -6,6 +6,9 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from bot.database.session import get_session_factory, is_database_configured
+from bot.repositories.clan_repository import ClanRepository
+
 
 BOT_ADMINS_FILE = Path("data/bot_admins.json")
 MASTER_ADMIN_IDS = {
@@ -19,6 +22,7 @@ BOT_ADMIN_IDS = {
 ALL_CLANS = [
     "Stag",
     "Goat",
+    "Raven",
     "Wolf",
     "Bear",
     "Boar",
@@ -44,6 +48,35 @@ DRAFT_FORMATS = {"bo1": 1, "bo3": 2, "bo5": 3}
 TIMER_UPDATE_SECONDS = 3
 
 active_drafts: dict[int, "DraftSession"] = {}
+
+
+class ClanRules:
+    def __init__(
+        self,
+        all_clans: list[str] | None = None,
+        clear_clans: set[str] | None = None,
+        kingdom_clans: set[str] | None = None,
+    ):
+        self.all_clans = all_clans or ALL_CLANS
+        self.clear_clans = clear_clans or CLEAR_CLANS
+        self.kingdom_clans = kingdom_clans or KINGDOM_CLANS
+
+
+DEFAULT_CLAN_RULES = ClanRules()
+
+
+async def load_clan_rules() -> ClanRules:
+    if not is_database_configured():
+        return DEFAULT_CLAN_RULES
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        clans = ClanRepository(session)
+        all_clans = await clans.enabled_names()
+        if not all_clans:
+            return DEFAULT_CLAN_RULES
+        clear_clans = set(await clans.clear_names())
+        kingdom_clans = set(await clans.kingdom_names())
+        return ClanRules(all_clans, clear_clans, kingdom_clans)
 
 
 def load_bot_admins() -> None:
@@ -106,7 +139,7 @@ class PlayerBanSelect(discord.ui.Select):
             placeholder="Выберите 1-2 клана для бана",
             min_values=1,
             max_values=2,
-            options=clan_options(ALL_CLANS),
+            options=clan_options(draft_view.clan_rules.all_clans),
         )
         self.draft_view = draft_view
 
@@ -124,9 +157,10 @@ class SkipBansButton(discord.ui.Button):
 
 
 class PlayerBanView(discord.ui.View):
-    def __init__(self, player: discord.Member):
+    def __init__(self, player: discord.Member, clan_rules: ClanRules):
         super().__init__(timeout=None)
         self.player = player
+        self.clan_rules = clan_rules
         self.result: set[str] | None = None
         self.prompt_message: discord.Message | None = None
         self.add_item(PlayerBanSelect(self))
@@ -173,12 +207,14 @@ class SinglePickView(discord.ui.View):
         player: discord.Member,
         available_clans: list[str],
         current_team_picks: list[str],
+        clan_rules: ClanRules,
     ):
         super().__init__(timeout=None)
         self.player = player
         self.available_clans = available_clans
         self.current_team_picks = current_team_picks
-        self.options = valid_single_pick_options(available_clans, current_team_picks)
+        self.clan_rules = clan_rules
+        self.options = valid_single_pick_options(available_clans, current_team_picks, clan_rules)
         self.result: str | None = None
         self.prompt_message: discord.Message | None = None
         self.add_item(SinglePickSelect(self))
@@ -188,7 +224,7 @@ class SinglePickView(discord.ui.View):
             await interaction.response.send_message("Сейчас выбирает другой игрок.", ephemeral=True)
             return
 
-        error = validate_team_pair([*self.current_team_picks, clan])
+        error = validate_team_pair([*self.current_team_picks, clan], self.clan_rules)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -279,6 +315,7 @@ class DraftSession:
         self.last_banned_clans = None
         self.last_available_clans = None
         self.last_picks_by_player = None
+        clan_rules = await load_clan_rules()
         try:
             await self.update_status(
                 "Баны",
@@ -289,9 +326,9 @@ class DraftSession:
                 draft_players=draft_players,
             )
 
-            bans_by_player = await self.collect_bans(draft_players)
+            bans_by_player = await self.collect_bans(draft_players, clan_rules)
             banned_clans = set().union(*bans_by_player.values())
-            available_clans = [clan for clan in ALL_CLANS if clan not in banned_clans]
+            available_clans = [clan for clan in clan_rules.all_clans if clan not in banned_clans]
             self.last_banned_clans = banned_clans
             self.last_available_clans = available_clans
 
@@ -317,6 +354,7 @@ class DraftSession:
                     draft_players,
                     banned_clans,
                     picks_by_player,
+                    clan_rules,
                     60,
                     "первый клан",
                 )
@@ -331,6 +369,7 @@ class DraftSession:
                     draft_players,
                     banned_clans,
                     picks_by_player,
+                    clan_rules,
                     player_2_deadline,
                     "первый клан",
                 )
@@ -343,6 +382,7 @@ class DraftSession:
                     draft_players,
                     banned_clans,
                     picks_by_player,
+                    clan_rules,
                     player_2_deadline,
                     "второй клан",
                 )
@@ -356,6 +396,7 @@ class DraftSession:
                     draft_players,
                     banned_clans,
                     picks_by_player,
+                    clan_rules,
                     60,
                     "второй клан",
                 )
@@ -448,8 +489,8 @@ class DraftSession:
 
         return "\n".join(lines)
 
-    async def collect_bans(self, draft_players: list[discord.Member]) -> dict[int, set[str]]:
-        views = {player.id: PlayerBanView(player) for player in self.players}
+    async def collect_bans(self, draft_players: list[discord.Member], clan_rules: ClanRules) -> dict[int, set[str]]:
+        views = {player.id: PlayerBanView(player, clan_rules) for player in self.players}
         prompt_messages: list[discord.Message] = []
         end_time = discord.utils.utcnow().timestamp() + 60
 
@@ -491,6 +532,7 @@ class DraftSession:
         draft_players: list[discord.Member],
         banned_clans: set[str],
         picks_by_player: dict[int, list[str]],
+        clan_rules: ClanRules,
         timeout: int,
         pick_label: str,
     ) -> str:
@@ -502,6 +544,7 @@ class DraftSession:
             draft_players,
             banned_clans,
             picks_by_player,
+            clan_rules,
             deadline,
             pick_label,
         )
@@ -514,10 +557,11 @@ class DraftSession:
         draft_players: list[discord.Member],
         banned_clans: set[str],
         picks_by_player: dict[int, list[str]],
+        clan_rules: ClanRules,
         deadline: float,
         pick_label: str,
     ) -> str:
-        view = SinglePickView(player, available_clans, current_team_picks)
+        view = SinglePickView(player, available_clans, current_team_picks, clan_rules)
         prompt_message = await self.channel.send(f"{player.mention}, выбери {pick_label}.", view=view)
         view.prompt_message = prompt_message
 
@@ -525,7 +569,7 @@ class DraftSession:
             while not view.is_finished():
                 remaining = deadline - discord.utils.utcnow().timestamp()
                 if remaining <= 0:
-                    auto_pick = random_valid_picks(1, available_clans, current_team_picks)[0]
+                    auto_pick = random_valid_picks(1, available_clans, current_team_picks, clan_rules)[0]
                     await self.update_status(
                         "Пик-фаза",
                         f"{player.mention} не успел выбрать {pick_label}. Рандомный пик: **{auto_pick}**",
@@ -551,7 +595,7 @@ class DraftSession:
             view.disable_all_items()
             await delete_message(prompt_message)
 
-        return view.result or random_valid_picks(1, available_clans, current_team_picks)[0]
+        return view.result or random_valid_picks(1, available_clans, current_team_picks, clan_rules)[0]
 
     async def record_win(self, winner: discord.Member) -> None:
         if not self.waiting_for_winner:
@@ -590,46 +634,61 @@ class DraftSession:
         )
 
 
-def validate_team_pair(picks: list[str]) -> str | None:
+def validate_team_pair(picks: list[str], clan_rules: ClanRules = DEFAULT_CLAN_RULES) -> str | None:
     if len(picks) != len(set(picks)):
         return "Нельзя брать 2 одинаковых клана."
-    if "Snake" in picks and any(clan in CLEAR_CLANS for clan in picks):
+    if "Snake" in picks and any(clan in clan_rules.clear_clans for clan in picks):
         return "Нельзя брать Snake вместе с клир-кланом."
-    if sum(clan in KINGDOM_CLANS for clan in picks) > 1:
+    if sum(clan in clan_rules.kingdom_clans for clan in picks) > 1:
         return "Нельзя брать 2 клана королевств."
-    if sum(clan in CLEAR_CLANS for clan in picks) > 1:
+    if sum(clan in clan_rules.clear_clans for clan in picks) > 1:
         return "Нельзя брать 2 клир-клана."
     return None
 
 
-def validate_pick(clans: list[str], count: int, available_clans: list[str], current_team_picks: list[str]) -> str | None:
+def validate_pick(
+    clans: list[str],
+    count: int,
+    available_clans: list[str],
+    current_team_picks: list[str],
+    clan_rules: ClanRules = DEFAULT_CLAN_RULES,
+) -> str | None:
     if len(clans) != count:
         return f"Нужно выбрать ровно {count} клан(а) из доступного пула."
     unavailable = [clan for clan in clans if clan not in available_clans]
     if unavailable:
         return f"Этот клан забанен или недоступен: {', '.join(unavailable)}."
-    return validate_team_pair([*current_team_picks, *clans])
+    return validate_team_pair([*current_team_picks, *clans], clan_rules)
 
 
-def valid_single_pick_options(available_clans: list[str], current_team_picks: list[str]) -> list[str]:
+def valid_single_pick_options(
+    available_clans: list[str],
+    current_team_picks: list[str],
+    clan_rules: ClanRules = DEFAULT_CLAN_RULES,
+) -> list[str]:
     options = [
         clan
         for clan in available_clans
-        if validate_pick([clan], 1, available_clans, current_team_picks) is None
+        if validate_pick([clan], 1, available_clans, current_team_picks, clan_rules) is None
     ]
     return options or available_clans
 
 
-def random_valid_picks(count: int, available_clans: list[str], current_team_picks: list[str]) -> list[str]:
+def random_valid_picks(
+    count: int,
+    available_clans: list[str],
+    current_team_picks: list[str],
+    clan_rules: ClanRules = DEFAULT_CLAN_RULES,
+) -> list[str]:
     candidates = available_clans.copy()
     random.shuffle(candidates)
     if count == 1:
         for clan in candidates:
-            if validate_team_pair([*current_team_picks, clan]) is None:
+            if validate_team_pair([*current_team_picks, clan], clan_rules) is None:
                 return [clan]
     else:
         for index, clan_1 in enumerate(candidates):
             for clan_2 in candidates[index + 1 :]:
-                if validate_team_pair([*current_team_picks, clan_1, clan_2]) is None:
+                if validate_team_pair([*current_team_picks, clan_1, clan_2], clan_rules) is None:
                     return [clan_1, clan_2]
     raise RuntimeError("Could not find a valid random pick")
