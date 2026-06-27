@@ -409,13 +409,13 @@ def register(bot: commands.Bot, settings: Settings) -> None:
                 await interaction.followup.send(str(error), ephemeral=True)
                 return
             if winner_member is None:
-                await interaction.followup.send("Результат не подтвержден. Обратитесь к администратору.")
+                await channel.send("Результат не подтвержден. Обратитесь к администратору.")
                 return
 
             winner_user = challenger_user if winner_member.id == interaction.user.id else opponent_user
             bear_match = await service.record_duel(challenger_user, opponent_user, winner_user)
 
-        await interaction.followup.send(
+        await channel.send(
             f"Медвежья дуэль завершена.\n"
             f"Игроки: {interaction.user.mention} vs {player.mention}\n"
             f"Победитель: {winner_member.mention}\n"
@@ -489,7 +489,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
                     await interaction.followup.send(str(error), ephemeral=True)
                     return
                 if game_winner is None:
-                    await interaction.followup.send("Результат игры не подтвержден. Обратитесь к администратору.")
+                    await channel.send("Результат игры не подтвержден. Обратитесь к администратору.")
                     return
                 if game_winner.id == interaction.user.id:
                     player1_wins += 1
@@ -501,7 +501,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
                 bear_match = await service.record_duel(challenger_user, opponent_user, game_winner_user)
 
             if winner_member is None:
-                await interaction.followup.send("Challenge завершился без победителя. Обратитесь к администратору.")
+                await channel.send("Challenge завершился без победителя. Обратитесь к администратору.")
                 return
 
             winner_user = challenger_user if winner_member.id == interaction.user.id else opponent_user
@@ -510,7 +510,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
 
         await refresh_bear_tierlist_message(bot)
         total_score = personal_score_text(bear_match, challenger_user, opponent_user) if bear_match is not None else "0:0"
-        await interaction.followup.send(
+        await channel.send(
             f"Медвежий challenge завершен.\n"
             f"Игроки: {interaction.user.mention} vs {player.mention}\n"
             f"Победитель серии: {winner_member.mention}\n"
