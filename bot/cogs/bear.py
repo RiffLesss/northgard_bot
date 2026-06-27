@@ -15,6 +15,8 @@ from bot.services.draft_service import is_admin
 
 BEAR_CHANNEL_ID = 1519833399085236304
 BEAR_TIERLIST_CHANNEL_ID = 1519833554375278683
+ACCEPT_TIMEOUT_SECONDS = 120
+WINNER_CONFIRM_TIMEOUT_SECONDS = 7200
 TIER_EMOJIS = {
     "Царь Медведь": "👑",
     "Короли Леса": "🌲",
@@ -32,7 +34,7 @@ bear_tierlist_message_id: int | None = None
 
 class AcceptChallengeView(discord.ui.View):
     def __init__(self, opponent_id: int):
-        super().__init__(timeout=120)
+        super().__init__(timeout=ACCEPT_TIMEOUT_SECONDS)
         self.opponent_id = opponent_id
         self.accepted = False
 
@@ -57,7 +59,7 @@ class AcceptChallengeView(discord.ui.View):
 
 class WinnerConfirmView(discord.ui.View):
     def __init__(self, player1: discord.Member, player2: discord.Member):
-        super().__init__(timeout=120)
+        super().__init__(timeout=WINNER_CONFIRM_TIMEOUT_SECONDS)
         self.player1 = player1
         self.player2 = player2
         self.choices: dict[int, int] = {}
@@ -263,7 +265,8 @@ async def ask_confirmed_winner(
         try:
             message = await channel.send(
                 f"{title}\n"
-                f"{player1.mention} и {player2.mention}, выберите победителя. Попытка {attempt}/2.",
+                f"{player1.mention} и {player2.mention}, выберите победителя в течение 2 часов. "
+                f"Попытка {attempt}/2.",
                 view=view,
             )
         except discord.Forbidden as error:
