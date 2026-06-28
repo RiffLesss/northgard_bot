@@ -329,7 +329,11 @@ class Team3DraftView(discord.ui.View):
         source = self.context.clear_clans if pick_type == PickType.CLEAR else self.context.eco_clans
         if source is None:
             source = []
-        return [clan for clan in source if clan not in self.bans]
+        unavailable_clans = set(self.bans) | self.picked_clans()
+        return [clan for clan in source if clan not in unavailable_clans]
+
+    def picked_clans(self) -> set[str]:
+        return {clan for picks in self.picks.values() for clan in picks}
 
     def available_options(self, step: Team3DraftStep) -> list[str]:
         options = self.clan_pool(step.pick_type)
@@ -552,6 +556,7 @@ class ResultConfirmView(discord.ui.View):
             return
 
         self.finished = True
+        await interaction.response.defer(ephemeral=True)
         await finish_team3_match(self.bot, interaction, self.context, accepted)
         self.stop()
 
@@ -657,9 +662,8 @@ async def finish_team3_match(
             f"Счет серии: **{series_score(context)}**.\n"
             f"Запускаю Game {context.game_number}."
         )
-        await interaction.response.send_message(message_text)
-        if context.text_channel is not None and context.text_channel.id != interaction.channel_id:
-            await context.text_channel.send(message_text)
+        if next_channel is not None:
+            await next_channel.send(message_text)
         if next_channel is not None:
             await start_team3_draft(bot, next_channel, context)
         return
@@ -683,9 +687,9 @@ async def finish_team3_match(
         f"Победитель: **{winner_label}**.{rating_text}\n"
         "Временные каналы и роли будут удалены через 10 секунд."
     )
-    await interaction.response.send_message(message_text)
-    if context.text_channel is not None and context.text_channel.id != interaction.channel_id:
-        await context.text_channel.send(message_text)
+    result_channel = context.text_channel or interaction.channel
+    if result_channel is not None:
+        await result_channel.send(message_text)
     active_team3_players.difference_update(match_discord_ids(context))
     await asyncio.sleep(10)
     await cleanup_match_resources(context)
@@ -717,6 +721,7 @@ class DisputeResolveView(discord.ui.View):
             await interaction.response.send_message("Только админ бота может решить спор.", ephemeral=True)
             return
         self.resolved = True
+        await interaction.response.defer(ephemeral=True)
         for item in self.children:
             item.disabled = True
         await interaction.message.edit(view=self)
@@ -824,19 +829,19 @@ class Team3PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Обычная 3v3", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Обычная 3v3", style=discord.ButtonStyle.primary, custom_id="team3_panel:casual")
     async def casual(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await join_casual_queue(interaction)
 
-    @discord.ui.button(label="Ranked 3v3", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Ranked 3v3", style=discord.ButtonStyle.success, custom_id="team3_panel:ranked")
     async def ranked(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await join_ranked_queue(interaction, wide=False)
 
-    @discord.ui.button(label="Ranked wide", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Ranked wide", style=discord.ButtonStyle.danger, custom_id="team3_panel:ranked_wide")
     async def ranked_wide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await join_ranked_queue(interaction, wide=True)
 
-    @discord.ui.button(label="Выйти из поиска", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Выйти из поиска", style=discord.ButtonStyle.secondary, custom_id="team3_panel:leave")
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         ranked_queue.pop(interaction.user.id, None)
         if interaction.channel_id is not None and is_in_casual_lobby(interaction.channel_id, interaction.user.id):
@@ -876,7 +881,7 @@ async def join_ranked_queue(interaction: discord.Interaction, wide: bool) -> Non
     mode = "wide" if wide else "normal"
     await interaction.response.send_message(f"Ты в ranked 3v3 queue. Режим: {mode}.", ephemeral=True)
     await update_team3_panel(interaction.channel, interaction.channel.id)
-    await maybe_start_ranked_match(interaction)
+    asyncio.create_task(maybe_start_ranked_match(interaction))
 
 
 async def join_casual_queue(interaction: discord.Interaction) -> None:
@@ -907,7 +912,7 @@ async def join_casual_queue(interaction: discord.Interaction) -> None:
     lobby.append((interaction.user.id,))
     await interaction.response.send_message("Ты добавлен в casual 3v3 lobby.", ephemeral=True)
     await update_team3_panel(interaction.channel, interaction.channel_id)
-    await maybe_start_casual_match(interaction)
+    asyncio.create_task(maybe_start_casual_match(interaction))
 
 
 async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
@@ -1104,6 +1109,8 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
+    bot.add_view(Team3PanelView())
+
     @bot.tree.command(name="team3_panel", description="Панель 3v3 матчей")
     @app_commands.default_permissions(manage_guild=True)
     async def team3_panel(interaction: discord.Interaction) -> None:
