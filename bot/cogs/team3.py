@@ -78,7 +78,7 @@ def ranked_wide_count() -> int:
 
 
 def voice_search_reminder() -> str:
-    return "Во время поиска оставайся в любом голосовом канале сервера, иначе бот не сможет перенести тебя в командный voice."
+    return "Stay in any server voice channel while searching, otherwise the bot will not be able to move you to a team voice channel."
 
 
 async def team3_announcement_channel(
@@ -108,13 +108,13 @@ async def send_team3_announcement(
 def render_team3_panel(channel_id: int) -> str:
     return (
         "# Northgard 3v3\n"
-        "Выбери режим кнопкой ниже.\n\n"
-        f"**Обычная 3v3:** {casual_lobby_count(channel_id)}/6 в lobby\n"
-        f"**Ranked 3v3:** {ranked_queue_count()} в очереди\n"
-        f"**Ranked wide:** {ranked_wide_count()} в wide-поиске\n\n"
-        "**Обычная 3v3** - solo lobby на 6 игроков, команды рандомятся.\n"
-        "**Ranked 3v3** - поиск с ограничением рейтинга.\n"
-        "**Ranked wide** - поиск с высоким разбросом рейтинга."
+        "Choose a mode with the buttons below.\n\n"
+        f"**Casual 3v3:** {casual_lobby_count(channel_id)}/6 in lobby\n"
+        f"**Ranked 3v3:** {ranked_queue_count()} in queue\n"
+        f"**Ranked wide:** {ranked_wide_count()} in wide queue\n\n"
+        "**Casual 3v3** - solo lobby for 6 players, teams are randomized.\n"
+        "**Ranked 3v3** - rating-limited matchmaking.\n"
+        "**Ranked wide** - matchmaking with a wider rating spread."
     )
 
 
@@ -390,23 +390,23 @@ class Team3DraftView(discord.ui.View):
 
     def render(self) -> str:
         step = self.current_step()
-        phase = "Драфт завершен" if step is None else f"Team {step.side}: {step.action_type.value} {step.pick_type.value}"
+        phase = "Draft finished" if step is None else f"Team {step.side}: {step.action_type.value} {step.pick_type.value}"
         available_clear = ", ".join(self.clan_pool(PickType.CLEAR)) or "-"
         available_eco = ", ".join(self.clan_pool(PickType.ECO)) or "-"
         return (
             f"# 3v3 Draft · Match #{self.context.match_id} · Game {self.context.game_number}\n"
-            f"**Счет серии:** {series_score(self.context)}\n"
+            f"**Series score:** {series_score(self.context)}\n"
             f"**Team A:** {member_names(self.context.team1_members)}\n"
             f"**Team B:** {member_names(self.context.team2_members)}\n"
             f"**Draft side A:** {member_names(self.side_members('A'))}\n"
             f"**Draft side B:** {member_names(self.side_members('B'))}\n\n"
-            f"**Фаза:** {phase}\n"
-            f"**Осталось на действие:** {self.remaining_text() if step is not None else '-'}\n"
-            f"**Баны:** {', '.join(self.bans) or '-'}\n"
+            f"**Phase:** {phase}\n"
+            f"**Time left for action:** {self.remaining_text() if step is not None else '-'}\n"
+            f"**Bans:** {', '.join(self.bans) or '-'}\n"
             f"**Draft side A picks:** {', '.join(self.picks['A']) or '-'}\n"
             f"**Draft side B picks:** {', '.join(self.picks['B']) or '-'}\n\n"
-            f"**Доступные clear:** {available_clear}\n"
-            f"**Доступные eco:** {available_eco}"
+            f"**Available clear:** {available_clear}\n"
+            f"**Available eco:** {available_eco}"
         )
 
     async def record_current_step(self, step: Team3DraftStep, clan: str) -> None:
@@ -450,14 +450,14 @@ class Team3DraftView(discord.ui.View):
         async with self.lock:
             step = self.current_step()
             if step is None:
-                await interaction.response.send_message("Драфт уже завершен.", ephemeral=True)
+                await interaction.response.send_message("The draft is already finished.", ephemeral=True)
                 return
             allowed_ids = {member.id for member in self.side_members(step.side)}
             if interaction.user.id not in allowed_ids:
-                await interaction.response.send_message(f"Сейчас выбирает Team {step.side}.", ephemeral=True)
+                await interaction.response.send_message(f"Team {step.side} is choosing now.", ephemeral=True)
                 return
             if clan not in self.available_options(step):
-                await interaction.response.send_message("Этот клан сейчас недоступен.", ephemeral=True)
+                await interaction.response.send_message("This clan is not available right now.", ephemeral=True)
                 return
 
             self.cancel_timer()
@@ -474,7 +474,7 @@ class Team3DraftView(discord.ui.View):
                 return
             options = self.available_options(step)
             if not options:
-                await cancel_team3_match(self.context, "В драфте не осталось доступных кланов. Матч отменен.")
+                await cancel_team3_match(self.context, "No clans are available in the draft. The match has been cancelled.")
                 self.finished = True
                 self.stop()
                 return
@@ -564,10 +564,10 @@ class ResultConfirmView(discord.ui.View):
 
     async def vote(self, interaction: discord.Interaction, winner_team_id: int) -> None:
         if self.finished:
-            await interaction.response.send_message("Результат уже подтвержден.", ephemeral=True)
+            await interaction.response.send_message("The result has already been confirmed.", ephemeral=True)
             return
         if self.team_for_user(interaction.user.id) is None:
-            await interaction.response.send_message("Ты не участвуешь в этом матче.", ephemeral=True)
+            await interaction.response.send_message("You are not a participant in this match.", ephemeral=True)
             return
         self.votes[interaction.user.id] = winner_team_id
         accepted = self.accepted_winner()
@@ -575,13 +575,13 @@ class ResultConfirmView(discord.ui.View):
             if self.has_conflict():
                 self.finished = True
                 await interaction.response.send_message(
-                    "Команды не согласовали победителя. Матч отправлен администраторам на решение.",
+                    "The teams did not agree on the winner. The match has been sent to admins for a decision.",
                     ephemeral=True,
                 )
                 await send_result_dispute(self.bot, self.context, self.votes)
                 self.stop()
                 return
-            await interaction.response.send_message("Голос принят. Ждем подтверждения 2 игроков из каждой команды.", ephemeral=True)
+            await interaction.response.send_message("Vote accepted. Waiting for confirmation from 2 players on each team.", ephemeral=True)
             return
 
         self.finished = True
@@ -593,13 +593,13 @@ class ResultConfirmView(discord.ui.View):
         if self.finished:
             return
         self.finished = True
-        await cancel_team3_match(self.context, "Время на подтверждение результата истекло. Матч отменен.")
+        await cancel_team3_match(self.context, "Result confirmation timed out. The match has been cancelled.")
 
-    @discord.ui.button(label="Победила Team A", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success)
     async def team_a_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team1_id)
 
-    @discord.ui.button(label="Победила Team B", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success)
     async def team_b_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team2_id)
 
@@ -619,17 +619,17 @@ class ReadyCheckView(discord.ui.View):
         accepted = len(self.accepted_ids)
         mentions = " ".join(member.mention for member in self.members)
         return (
-            f"**{self.title} найден.**\n"
+            f"**{self.title} found.**\n"
             f"{mentions}\n\n"
-            f"Нужно принять матч: **{accepted}/6**\n"
-            f"Время на подтверждение: 60 секунд."
+            f"Players ready: **{accepted}/6**\n"
+            f"Confirmation time: 60 seconds."
         )
 
-    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         allowed_ids = {member.id for member in self.members}
         if interaction.user.id not in allowed_ids:
-            await interaction.response.send_message("Ты не участвуешь в этом ready-check.", ephemeral=True)
+            await interaction.response.send_message("You are not a participant in this ready-check.", ephemeral=True)
             return
         self.accepted_ids.add(interaction.user.id)
         if len(self.accepted_ids) == len(self.members):
@@ -640,11 +640,11 @@ class ReadyCheckView(discord.ui.View):
             return
         await self.update_message(interaction)
 
-    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         allowed_ids = {member.id for member in self.members}
         if interaction.user.id not in allowed_ids:
-            await interaction.response.send_message("Ты не участвуешь в этом ready-check.", ephemeral=True)
+            await interaction.response.send_message("You are not a participant in this ready-check.", ephemeral=True)
             return
         self.declined_id = interaction.user.id
         for item in self.children:
@@ -686,10 +686,10 @@ async def finish_team3_match(
         context.game_number += 1
         next_channel = context.text_channel or interaction.channel
         message_text = (
-            f"Game {finished_game} завершена.\n"
-            f"Победитель: **{winner_label}**.\n"
-            f"Счет серии: **{series_score(context)}**.\n"
-            f"Запускаю Game {context.game_number}."
+            f"Game {finished_game} finished.\n"
+            f"Winner: **{winner_label}**.\n"
+            f"Series score: **{series_score(context)}**.\n"
+            f"Starting Game {context.game_number}."
         )
         if next_channel is not None:
             await next_channel.send(message_text)
@@ -709,12 +709,12 @@ async def finish_team3_match(
             delta = 0
             await service.finish_casual_match(context.match_id, winner_team_id)
 
-    rating_text = f"\nРейтинг: +{delta}/-{delta}" if context.game_mode == GameMode.RANKED else ""
+    rating_text = f"\nRating: +{delta}/-{delta}" if context.game_mode == GameMode.RANKED else ""
     message_text = (
-        f"Матч #{context.match_id} завершен.\n"
-        f"Финальный счет: **{series_score(context)}**.\n"
-        f"Победитель: **{winner_label}**.{rating_text}\n"
-        "Временные каналы и роли будут удалены через 10 секунд."
+        f"Match #{context.match_id} finished.\n"
+        f"Final score: **{series_score(context)}**.\n"
+        f"Winner: **{winner_label}**.{rating_text}\n"
+        "Temporary channels and roles will be deleted in 10 seconds."
     )
     result_channel = context.text_channel or interaction.channel
     if result_channel is not None:
@@ -728,7 +728,7 @@ async def cancel_team3_match(context: Team3MatchContext, reason: str) -> None:
     active_team3_players.difference_update(match_discord_ids(context))
     if context.text_channel is not None:
         try:
-            await context.text_channel.send(f"{reason}\nВременные каналы и роли будут удалены через 10 секунд.")
+            await context.text_channel.send(f"{reason}\nTemporary channels and roles will be deleted in 10 seconds.")
         except (discord.Forbidden, discord.NotFound):
             pass
     await asyncio.sleep(10)
@@ -744,10 +744,10 @@ class DisputeResolveView(discord.ui.View):
 
     async def resolve(self, interaction: discord.Interaction, winner_team_id: int) -> None:
         if self.resolved:
-            await interaction.response.send_message("Этот спор уже решен.", ephemeral=True)
+            await interaction.response.send_message("This dispute has already been resolved.", ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-            await interaction.response.send_message("Только админ бота может решить спор.", ephemeral=True)
+            await interaction.response.send_message("Only a bot admin can resolve this dispute.", ephemeral=True)
             return
         self.resolved = True
         await interaction.response.defer(ephemeral=True)
@@ -756,11 +756,11 @@ class DisputeResolveView(discord.ui.View):
         await interaction.message.edit(view=self)
         await finish_team3_match(self.bot, interaction, self.context, winner_team_id)
 
-    @discord.ui.button(label="Победила Team A", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success)
     async def team_a_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.resolve(interaction, self.context.team1_id)
 
-    @discord.ui.button(label="Победила Team B", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success)
     async def team_b_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.resolve(interaction, self.context.team2_id)
 
@@ -774,7 +774,7 @@ async def send_result_dispute(bot: commands.Bot, context: Team3MatchContext, vot
             channel = None
     if not isinstance(channel, discord.TextChannel):
         if context.text_channel is not None:
-            await context.text_channel.send("Не удалось отправить спор администраторам. Обратитесь к администратору вручную.")
+            await context.text_channel.send("Could not send the dispute to admins. Please contact an admin manually.")
         return
 
     def vote_label(member: discord.Member) -> str:
@@ -783,29 +783,29 @@ async def send_result_dispute(bot: commands.Bot, context: Team3MatchContext, vot
             return f"{member.mention}: Team A"
         if vote == context.team2_id:
             return f"{member.mention}: Team B"
-        return f"{member.mention}: нет голоса"
+        return f"{member.mention}: no vote"
 
     await channel.send(
         "@here\n"
-        f"Спорный результат 3v3 матча #{context.match_id}.\n"
-        f"Game {context.game_number}. Счет серии: {series_score(context)}.\n"
+        f"Disputed result for 3v3 match #{context.match_id}.\n"
+        f"Game {context.game_number}. Series score: {series_score(context)}.\n"
         f"Team A: {team_mentions(context.team1_members)}\n"
         f"Team B: {team_mentions(context.team2_members)}\n\n"
-        "**Голоса Team A:**\n"
+        "**Team A votes:**\n"
         + "\n".join(vote_label(member) for member in context.team1_members)
-        + "\n\n**Голоса Team B:**\n"
+        + "\n\n**Team B votes:**\n"
         + "\n".join(vote_label(member) for member in context.team2_members)
-        + "\n\nВыберите победителя:",
+        + "\n\nChoose the winner:",
         view=DisputeResolveView(bot, context),
     )
 
 
 async def start_result_confirmation(bot: commands.Bot, channel: discord.abc.Messageable, context: Team3MatchContext) -> None:
     await channel.send(
-        f"Матч #{context.match_id}, Game {context.game_number} началась.\n"
-        f"Счет серии: **{series_score(context)}**.\n"
-        f"После игры подтвердите победителя. Нужно минимум 2 голоса от каждой команды.\n"
-        f"Лимит времени: {'2 часа' if context.best_of == BestOf.BO1 else '24 часа'}.",
+        f"Match #{context.match_id}, Game {context.game_number} has started.\n"
+        f"Series score: **{series_score(context)}**.\n"
+        f"After the game, confirm the winner. At least 2 votes from each team are required.\n"
+        f"Time limit: {'2 hours' if context.best_of == BestOf.BO1 else '24 hours'}.",
         view=ResultConfirmView(bot, context),
     )
 
@@ -858,7 +858,7 @@ class Team3PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Обычная 3v3", style=discord.ButtonStyle.primary, custom_id="team3_panel:casual")
+    @discord.ui.button(label="Casual 3v3", style=discord.ButtonStyle.primary, custom_id="team3_panel:casual")
     async def casual(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await join_casual_queue(interaction)
 
@@ -870,7 +870,7 @@ class Team3PanelView(discord.ui.View):
     async def ranked_wide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await join_ranked_queue(interaction, wide=True)
 
-    @discord.ui.button(label="Выйти из поиска", style=discord.ButtonStyle.secondary, custom_id="team3_panel:leave")
+    @discord.ui.button(label="Leave queue", style=discord.ButtonStyle.secondary, custom_id="team3_panel:leave")
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         ranked_queue.pop(interaction.user.id, None)
         if interaction.channel_id is not None and is_in_casual_lobby(interaction.channel_id, interaction.user.id):
@@ -879,18 +879,18 @@ class Team3PanelView(discord.ui.View):
             ]
         if interaction.channel is not None and interaction.channel_id is not None:
             await update_team3_panel(interaction.channel, interaction.channel_id)
-        await interaction.response.send_message("Ты вышел из очереди/lobby.", ephemeral=True)
+        await interaction.response.send_message("You left the queue/lobby.", ephemeral=True)
 
 
 async def join_ranked_queue(interaction: discord.Interaction, wide: bool) -> None:
     if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("Поиск доступен только на сервере.", ephemeral=True)
+        await interaction.response.send_message("Search is only available on a server.", ephemeral=True)
         return
     if not is_database_configured():
-        await interaction.response.send_message("База данных не настроена.", ephemeral=True)
+        await interaction.response.send_message("Database is not configured.", ephemeral=True)
         return
     if interaction.user.id in active_team3_players:
-        await interaction.response.send_message("Ты уже участвуешь в активном 3v3 матче.", ephemeral=True)
+        await interaction.response.send_message("You are already in an active 3v3 match.", ephemeral=True)
         return
     session_factory = get_session_factory()
     async with session_factory() as session:
@@ -909,10 +909,10 @@ async def join_ranked_queue(interaction: discord.Interaction, wide: bool) -> Non
     )
     mode = "wide" if wide else "normal"
     await interaction.response.send_message(
-        f"✅ Ты вошел в Ranked 3v3 queue.\n"
-        f"Режим: **{mode}**.\n"
-        f"Сейчас в ranked queue: **{ranked_queue_count()}**.\n"
-        f"В wide-поиске: **{ranked_wide_count()}**.\n\n"
+        f"OK. You joined the Ranked 3v3 queue.\n"
+        f"Mode: **{mode}**.\n"
+        f"Players in ranked queue: **{ranked_queue_count()}**.\n"
+        f"Players in wide queue: **{ranked_wide_count()}**.\n\n"
         f"{voice_search_reminder()}",
         ephemeral=True,
     )
@@ -922,16 +922,16 @@ async def join_ranked_queue(interaction: discord.Interaction, wide: bool) -> Non
 
 async def join_casual_queue(interaction: discord.Interaction) -> None:
     if interaction.guild is None or interaction.channel_id is None or interaction.channel is None:
-        await interaction.response.send_message("Поиск доступен только на сервере.", ephemeral=True)
+        await interaction.response.send_message("Search is only available on a server.", ephemeral=True)
         return
     if not is_database_configured():
-        await interaction.response.send_message("База данных не настроена.", ephemeral=True)
+        await interaction.response.send_message("Database is not configured.", ephemeral=True)
         return
     if interaction.user.id in active_team3_players:
-        await interaction.response.send_message("Ты уже участвуешь в активном 3v3 матче.", ephemeral=True)
+        await interaction.response.send_message("You are already in an active 3v3 match.", ephemeral=True)
         return
     if is_in_casual_lobby(interaction.channel_id, interaction.user.id):
-        await interaction.response.send_message("Ты уже находишься в casual lobby.", ephemeral=True)
+        await interaction.response.send_message("You are already in the casual lobby.", ephemeral=True)
         return
     session_factory = get_session_factory()
     async with session_factory() as session:
@@ -943,12 +943,12 @@ async def join_casual_queue(interaction: discord.Interaction) -> None:
             return
     lobby = casual_lobbies.setdefault(interaction.channel_id, [])
     if casual_lobby_count(interaction.channel_id) >= 6:
-        await interaction.response.send_message("Casual lobby уже заполнено.", ephemeral=True)
+        await interaction.response.send_message("Casual lobby is already full.", ephemeral=True)
         return
     lobby.append((interaction.user.id,))
     await interaction.response.send_message(
-        f"✅ Ты вошел в Casual 3v3 lobby.\n"
-        f"Сейчас в lobby: **{casual_lobby_count(interaction.channel_id)}/6**.\n\n"
+        f"OK. You joined the Casual 3v3 lobby.\n"
+        f"Players in lobby: **{casual_lobby_count(interaction.channel_id)}/6**.\n\n"
         f"{voice_search_reminder()}",
         ephemeral=True,
     )
@@ -973,7 +973,7 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
     team1_members = [await fetch_member(interaction.guild, entry.discord_id) for entry in split.team_a]
     team2_members = [await fetch_member(interaction.guild, entry.discord_id) for entry in split.team_b]
     if any(member is None for member in [*team1_members, *team2_members]):
-        await send_team3_announcement(interaction.guild, interaction.channel, "Не удалось найти всех игроков на сервере. Матч отменен.")
+        await send_team3_announcement(interaction.guild, interaction.channel, "Could not find all players on the server. Match cancelled.")
         return
     members = [member for member in [*team1_members, *team2_members] if member is not None]
     missing_voice = missing_voice_members(members)
@@ -984,17 +984,17 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Матч найден, но не все игроки находятся в голосовом канале. "
-            f"Игроки удалены из очереди: {team_mentions(missing_voice)}",
+            "Match found, but not all players are in a voice channel. "
+            f"Removed from queue: {team_mentions(missing_voice)}",
         )
         return
 
     try:
         ready_channel = await create_ready_text_channel(interaction.guild, members, interaction.channel, "ranked-3v3")
-        await send_team3_announcement(interaction.guild, interaction.channel, f"Ranked 3v3 найден. Ready-check: {ready_channel.mention}")
+        await send_team3_announcement(interaction.guild, interaction.channel, f"Ranked 3v3 found. Ready-check: {ready_channel.mention}")
     except discord.Forbidden:
         ready_channel = interaction.channel
-        await send_team3_announcement(interaction.guild, interaction.channel, "У бота нет прав создать ready-check канал. Ready-check будет здесь.")
+        await send_team3_announcement(interaction.guild, interaction.channel, "The bot cannot create a ready-check channel. Ready-check will happen here.")
 
     pending_ready_checks.add(interaction.channel.id)
     ready_check = await run_ready_check(ready_channel, members, "Ranked 3v3")
@@ -1005,7 +1005,7 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Ready-check не принят всеми игроками. Матч отменен, принявшие игроки остаются в очереди."
+            "Ready-check was not accepted by all players. Match cancelled; players who accepted remain in queue."
         )
         for discord_id in declined_or_missing:
             ranked_queue.pop(discord_id, None)
@@ -1038,18 +1038,18 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Матч создан, но у бота нет прав создать роли/голосовые каналы или переместить игроков."
+            "Match created, but the bot cannot create roles/voice channels or move players."
         )
     draft_channel = context.text_channel or interaction.channel
 
     await send_team3_announcement(
         interaction.guild,
         interaction.channel,
-        f"Ranked 3v3 найден. Match #{context.match_id}\n"
+        f"Ranked 3v3 found. Match #{context.match_id}\n"
         f"Team A: {team_mentions(context.team1_members)}\n"
         f"Team B: {team_mentions(context.team2_members)}\n"
-        f"Разница рейтинга команд: {split.rating_diff}\n"
-        f"Draft channel: {draft_channel.mention if isinstance(draft_channel, discord.TextChannel) else 'этот канал'}",
+        f"Team rating difference: {split.rating_diff}\n"
+        f"Draft channel: {draft_channel.mention if isinstance(draft_channel, discord.TextChannel) else 'this channel'}",
     )
     await start_team3_draft(interaction.client, draft_channel, context)
 
@@ -1081,14 +1081,14 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Casual lobby заполнено, но невозможно собрать две команды без blacklist-конфликтов. "
-            "Кому-то нужно выйти из lobby или изменить blacklist.",
+            "Casual lobby is full, but two teams cannot be created without blacklist conflicts. "
+            "Someone needs to leave the lobby or update their blacklist.",
         )
         return
     team1_members = [await fetch_member(interaction.guild, user.discord_id) for user in team1_users]
     team2_members = [await fetch_member(interaction.guild, user.discord_id) for user in team2_users]
     if any(member is None for member in [*team1_members, *team2_members]):
-        await send_team3_announcement(interaction.guild, interaction.channel, "Не удалось найти всех игроков на сервере. Lobby очищено.")
+        await send_team3_announcement(interaction.guild, interaction.channel, "Could not find all players on the server. Lobby cleared.")
         clear_lobby(interaction.channel_id)
         return
     members = [member for member in [*team1_members, *team2_members] if member is not None]
@@ -1100,17 +1100,17 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Матч найден, но не все игроки находятся в голосовом канале. "
-            f"Игроки удалены из lobby: {team_mentions(missing_voice)}. Осталось: {remaining_count}/6.",
+            "Match found, but not all players are in a voice channel. "
+            f"Removed from lobby: {team_mentions(missing_voice)}. Remaining: {remaining_count}/6.",
         )
         return
 
     try:
         ready_channel = await create_ready_text_channel(interaction.guild, members, interaction.channel, "casual-3v3")
-        await send_team3_announcement(interaction.guild, interaction.channel, f"Casual 3v3 найден. Ready-check: {ready_channel.mention}")
+        await send_team3_announcement(interaction.guild, interaction.channel, f"Casual 3v3 found. Ready-check: {ready_channel.mention}")
     except discord.Forbidden:
         ready_channel = interaction.channel
-        await send_team3_announcement(interaction.guild, interaction.channel, "У бота нет прав создать ready-check канал. Ready-check будет здесь.")
+        await send_team3_announcement(interaction.guild, interaction.channel, "The bot cannot create a ready-check channel. Ready-check will happen here.")
 
     pending_ready_checks.add(interaction.channel_id)
     ready_check = await run_ready_check(ready_channel, members, "Casual 3v3")
@@ -1124,8 +1124,8 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Ready-check не принят всеми игроками. "
-            f"Принявшие игроки остаются в lobby: {remaining_count}/6.",
+            "Ready-check was not accepted by all players. "
+            f"Players who accepted remain in lobby: {remaining_count}/6.",
         )
         if isinstance(ready_channel, discord.TextChannel):
             await delete_channel(ready_channel)
@@ -1152,17 +1152,17 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(
             interaction.guild,
             interaction.channel,
-            "Матч создан, но у бота нет прав создать голосовые каналы или переместить игроков."
+            "Match created, but the bot cannot create voice channels or move players."
         )
     draft_channel = context.text_channel or interaction.channel
 
     await send_team3_announcement(
         interaction.guild,
         interaction.channel,
-        f"Casual 3v3 собран. Match #{context.match_id}\n"
+        f"Casual 3v3 ready. Match #{context.match_id}\n"
         f"Team A: {team_mentions(context.team1_members)}\n"
         f"Team B: {team_mentions(context.team2_members)}\n"
-        f"Draft channel: {draft_channel.mention if isinstance(draft_channel, discord.TextChannel) else 'этот канал'}",
+        f"Draft channel: {draft_channel.mention if isinstance(draft_channel, discord.TextChannel) else 'this channel'}",
     )
     await start_team3_draft(interaction.client, draft_channel, context)
 
@@ -1170,21 +1170,21 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
 def register(bot: commands.Bot, settings: Settings) -> None:
     bot.add_view(Team3PanelView())
 
-    @bot.tree.command(name="team3_panel", description="Панель 3v3 матчей")
+    @bot.tree.command(name="team3_panel", description="Create the 3v3 matchmaking panel")
     @app_commands.default_permissions(manage_guild=True)
     async def team3_panel(interaction: discord.Interaction) -> None:
         if interaction.channel_id is None:
-            await interaction.response.send_message("Не удалось определить канал.", ephemeral=True)
+            await interaction.response.send_message("Could not determine the channel.", ephemeral=True)
             return
         await interaction.response.send_message(render_team3_panel(interaction.channel_id), view=Team3PanelView())
         message = await interaction.original_response()
         team3_panel_messages[interaction.channel_id] = message.id
 
-    @bot.tree.command(name="tournament_3v3_start", description="Запустить турнирный 3v3 draft")
+    @bot.tree.command(name="tournament_3v3_start", description="Start a tournament 3v3 draft")
     @app_commands.describe(
-        team_a_role="Роль первой команды",
-        team_b_role="Роль второй команды",
-        best_of="Формат серии",
+        team_a_role="First team role",
+        team_b_role="Second team role",
+        best_of="Series format",
     )
     @app_commands.choices(
         best_of=[
@@ -1201,24 +1201,24 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         best_of: app_commands.Choice[str],
     ) -> None:
         if not is_database_configured():
-            await interaction.response.send_message("База данных не настроена.", ephemeral=True)
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
             return
         if interaction.guild is None or interaction.channel is None:
-            await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
+            await interaction.response.send_message("This command is only available on a server.", ephemeral=True)
             return
 
         team_a_members = [member for member in team_a_role.members if not member.bot]
         team_b_members = [member for member in team_b_role.members if not member.bot]
         if len(team_a_members) != 3 or len(team_b_members) != 3:
             await interaction.response.send_message(
-                "В каждой командной роли должно быть ровно 3 зарегистрированных игрока.",
+                "Each team role must contain exactly 3 registered players.",
                 ephemeral=True,
             )
             return
         busy_members = [member for member in [*team_a_members, *team_b_members] if member.id in active_team3_players]
         if busy_members:
             await interaction.response.send_message(
-                "Нельзя запустить матч: эти игроки уже участвуют в активном 3v3 матче: "
+                "Cannot start the match: these players are already in an active 3v3 match: "
                 f"{team_mentions(busy_members)}",
                 ephemeral=True,
             )
@@ -1238,7 +1238,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             return
 
         await interaction.followup.send(
-            f"Tournament 3v3 создан. Match #{context.match_id}, bo{best_of.value}.\n"
+            f"Tournament 3v3 created. Match #{context.match_id}, bo{best_of.value}.\n"
             f"Team A: {team_mentions(context.team1_members)}\n"
             f"Team B: {team_mentions(context.team2_members)}"
         )

@@ -1,103 +1,103 @@
-# 3v3 режимы
+# 3v3 Modes
 
-## Панель 3v3
+## 3v3 Panel
 
-Админ сервера отправляет команду в нужном канале:
+A server admin sends this command in the target channel:
 
 ```text
 /team3_panel
 ```
 
-Бот отправит одно сообщение с кнопками:
+The bot sends one message with buttons:
 
 ```text
-Обычная 3v3
+Casual 3v3
 Ranked 3v3
 Ranked wide
-Выйти из поиска
+Leave queue
 ```
 
-В этом же сообщении бот показывает текущие счетчики lobby/очередей и обновляет их, когда игрок входит в поиск или выходит из него.
+The same message shows current lobby/queue counters and updates when players join or leave.
 
-## Обычная 3v3
+## Casual 3v3
 
-Игрок нажимает кнопку `Обычная 3v3`.
+A player presses `Casual 3v3`.
 
-Правила:
+Rules:
 
-- только solo queue;
-- party/готовые группы в casual отключены;
-- когда набирается 6 игроков, бот случайно делит их на две команды;
-- все 6 игроков должны быть в любом voice-канале сервера;
-- после найденного матча бот создает временный текстовый канал и запускает ready-check.
+- solo queue only;
+- parties/pre-made groups are disabled for casual;
+- when 6 players are gathered, the bot randomly splits them into two teams;
+- all 6 players must be in any server voice channel;
+- after a match is found, the bot creates a temporary text channel and starts a ready-check.
 
-Если кто-то не находится в voice, такой игрок удаляется из lobby, остальные продолжают ждать.
+If someone is not in voice, that player is removed from the lobby and the others keep waiting.
 
 ## Ranked 3v3
 
-Игрок нажимает кнопку `Ranked 3v3`.
+A player presses `Ranked 3v3`.
 
-Бот ищет 6 игроков с подходящим разбросом рейтинга:
+The bot searches for 6 players within the normal rating spread:
 
 ```text
 max_rating - min_rating <= 300
 ```
 
-Когда матч найден, бот выбирает наиболее равные команды по сумме рейтинга.
+When a match is found, the bot creates the most balanced teams by total rating.
 
-## Ranked wide
+## Ranked Wide
 
-Игрок нажимает кнопку `Ranked wide`.
+A player presses `Ranked wide`.
 
-Это поиск с высоким разбросом рейтинга. Матч без ограничения рейтинга создастся только если все 6 выбранных игроков ищут wide.
+This is matchmaking with a wider rating spread. A match without the normal rating limit is created only if all 6 selected players are searching wide.
 
-## Поиск и активный матч
+## Search And Active Matches
 
-Игрок может одновременно стоять в разных поисках, например в casual и ranked.
+A player can be in multiple searches at the same time, for example casual and ranked.
 
-Но если игрок уже участвует в активном 3v3 матче, он не сможет зайти в новый поиск до завершения или отмены текущего матча.
+But if a player is already in an active 3v3 match, they cannot join a new search until the current match is finished or cancelled.
 
-При формировании команд бот учитывает личные blacklist-списки игроков. Если игрок добавил кого-то в blacklist, бот не будет ставить их в одну команду.
+The bot uses each player's personal blacklist when forming teams. If a player blacklisted someone, the bot will not place them on the same team.
 
-В ranked бот попробует найти другую подходящую шестерку или другой split. В casual, если текущие 6 игроков нельзя поделить на две команды без blacklist-конфликтов, lobby останется собранным, но матч не стартует, пока кто-то не выйдет или не изменит blacklist.
+In ranked, the bot tries another valid group of 6 or another split. In casual, if the current 6 players cannot be split into two teams without blacklist conflicts, the lobby stays full but the match does not start until someone leaves or updates their blacklist.
 
-## Ready-check
+## Ready-Check
 
-Ready-check проходит во временном приватном текстовом канале найденного матча.
+Ready-check happens in the temporary private text channel for the found match.
 
-Кнопки:
-
-```text
-Принять
-Отклонить
-```
-
-Все 6 игроков должны нажать `Принять` за 60 секунд.
-
-Если ready-check не принят:
-
-- матч отменяется;
-- игроки, которые приняли матч, остаются в lobby/очереди;
-- игроки, которые не ответили или отклонили матч, выходят из lobby/очереди;
-- временный ready-check канал удаляется.
-
-## Драфт
-
-После ready-check бот запускает draft-сообщение с select menu.
-
-Пулы clear/eco берутся из таблицы `clans`. Включенные кланы с `is_clear=true` попадают в clear-пул, остальные включенные кланы попадают в eco-пул.
-
-Выбирать может любой игрок команды, чья очередь указана в фазе:
+Buttons:
 
 ```text
-Фаза: Team A: ban clear
+Accept
+Decline
 ```
 
-На каждое действие draft дается 2 минуты. В draft-сообщении отображается оставшееся время, бот обновляет его примерно раз в 5 секунд.
+All 6 players must press `Accept` within 60 seconds.
 
-Если команда не успела выбрать клан за 2 минуты, бот случайно выбирает один из доступных кланов и переводит draft к следующему шагу.
+If ready-check is not accepted:
 
-Порядок драфта:
+- the match is cancelled;
+- players who accepted remain in the lobby/queue;
+- players who did not answer or declined leave the lobby/queue;
+- the temporary ready-check channel is deleted.
+
+## Draft
+
+After ready-check, the bot starts a draft message with a select menu.
+
+Clear/eco pools are loaded from the `clans` table. Enabled clans with `is_clear=true` go to the clear pool, all other enabled clans go to the eco pool.
+
+Any player from the team whose turn is shown in the phase can choose:
+
+```text
+Phase: Team A: ban clear
+```
+
+Each draft action has a 2-minute timer. The draft message shows the remaining time and updates roughly every 5 seconds.
+
+If a team does not choose a clan within 2 minutes, the bot randomly chooses one of the available clans and moves to the next step.
+
+Draft order:
 
 ```text
 A ban clear - B ban clear
@@ -111,74 +111,74 @@ B ban eco - A ban eco
 A pick eco - B pick eco
 ```
 
-Правила:
+Rules:
 
-- нельзя брать одинаковые кланы внутри команды;
-- нельзя брать забаненные кланы;
-- баны общие;
-- нельзя брать 2 clear-клана в одну команду.
+- no duplicate clans inside one team;
+- banned clans cannot be picked;
+- bans are shared;
+- one team cannot pick 2 clear clans.
 
-В bo3/bo5 draft-стороны меняются каждую игру.
+In bo3/bo5, draft sides swap every game.
 
-## Подтверждение результата
+## Result Confirmation
 
-После драфта бот отправляет кнопки:
+After draft, the bot sends buttons:
 
 ```text
-Победила Team A
-Победила Team B
+Team A won
+Team B won
 ```
 
-Нужно, чтобы минимум 2 игрока из Team A и минимум 2 игрока из Team B подтвердили одного победителя.
+At least 2 players from Team A and at least 2 players from Team B must confirm the same winner.
 
-Лимиты на подтверждение:
+Confirmation limits:
 
-- bo1: 2 часа;
-- bo3/bo5: 24 часа.
+- bo1: 2 hours;
+- bo3/bo5: 24 hours.
 
-Если время вышло, матч отменяется, а временные каналы и роли удаляются.
+If time runs out, the match is cancelled and temporary channels/roles are deleted.
 
-Если команды выбрали разных победителей, бот отправляет спорный результат в админский канал `1520167921194766518` с тегом `@here`. Там появляются кнопки выбора победителя. После решения админа результат применяется к текущей игре, а если серия еще не закончилась, следующая игра продолжается в исходном match-канале.
+If teams choose different winners, the bot sends a disputed result to admin channel `1520167921194766518` with `@here`. Admins get buttons to choose the winner. After an admin decision, the result is applied to the current game. If the series is not finished, the next game continues in the original match channel.
 
-## Завершение матча
+## Match Finish
 
-После финального подтверждения:
+After final confirmation:
 
-- casual записывает результат без изменения рейтинга;
-- ranked записывает результат и обновляет рейтинг;
-- tournament записывает результат серии;
-- бот удаляет временный текстовый канал матча;
-- casual/ranked удаляют временные voice-каналы;
-- ranked удаляет временные командные роли.
+- casual records the result without rating changes;
+- ranked records the result and updates rating;
+- tournament records the series result;
+- the bot deletes the temporary match text channel;
+- casual/ranked temporary voice channels are deleted;
+- ranked temporary team roles are deleted.
 
-## Временные каналы
+## Temporary Channels
 
-Для casual и ranked бот создает временный приватный текстовый канал:
+For casual and ranked, the bot creates a temporary private text channel:
 
 ```text
 3v3-match-123
 ```
 
-В него попадают:
+It contains:
 
 - ready-check;
 - draft;
-- подтверждение результата;
-- продолжение bo3/bo5 серии;
-- финальное сообщение о победителе.
+- result confirmation;
+- bo3/bo5 series continuation;
+- final winner message.
 
-Для casual и ranked бот также создает временные voice-каналы команд:
+For casual and ranked, the bot also creates temporary team voice channels:
 
 ```text
 3v3 Team A #123
 3v3 Team B #123
 ```
 
-В casual voice-каналы открыты для всех участников сервера. В ranked voice-каналы приватные для команд.
+In casual, voice channels are open for everyone on the server. In ranked, voice channels are private for the teams.
 
-## Турнирная 3v3
+## Tournament 3v3
 
-Организатор пишет:
+The organizer sends:
 
 ```text
 /tournament_3v3_start @team_a_role @team_b_role bo1
@@ -186,6 +186,6 @@ A pick eco - B pick eco
 /tournament_3v3_start @team_a_role @team_b_role bo5
 ```
 
-В каждой командной роли должно быть ровно 3 игрока.
+Each team role must contain exactly 3 players.
 
-Турнирный режим не создает роли и voice-каналы. Он отвечает за draft, подтверждение результата и запись победителя серии.
+Tournament mode does not create roles or voice channels. It handles draft, result confirmation, and series winner recording.
