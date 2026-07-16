@@ -358,11 +358,7 @@ class Team3DraftView(discord.ui.View):
         source = self.context.clear_clans if pick_type == PickType.CLEAR else self.context.eco_clans
         if source is None:
             source = []
-        unavailable_clans = set(self.bans) | self.picked_clans()
-        return [clan for clan in source if clan not in unavailable_clans]
-
-    def picked_clans(self) -> set[str]:
-        return {clan for picks in self.picks.values() for clan in picks}
+        return [clan for clan in source if clan not in self.bans]
 
     def available_options(self, step: Team3DraftStep) -> list[str]:
         options = self.clan_pool(step.pick_type)

@@ -1,9 +1,12 @@
 import unittest
 
+from bot.cogs.team3 import Team3DraftView, Team3MatchContext
+from bot.models.enums import BestOf, DraftActionType, GameMode, PickType
 from bot.services.team3_service import (
     NORMAL_RATING_SPREAD,
     QueueEntry,
     TEAM3_DRAFT_STEPS,
+    Team3DraftStep,
     find_best_ranked_match,
     rating_delta,
     split_casual_players,
@@ -81,6 +84,32 @@ class Team3ServiceTest(unittest.TestCase):
         expected_loss = rating_delta(1300, 900)
 
         self.assertGreater(upset_loss, expected_loss)
+
+    def test_team3_draft_allows_same_clan_on_opposing_teams(self) -> None:
+        context = Team3MatchContext(
+            match_id=1,
+            team1_id=1,
+            team2_id=2,
+            team1_members=[],
+            team2_members=[],
+            team1_user_ids=[],
+            team2_user_ids=[],
+            game_mode=GameMode.CASUAL,
+            best_of=BestOf.BO1,
+            clear_clans=["Wolf", "Lynx"],
+            eco_clans=["Bear"],
+        )
+        view = Team3DraftView(context, None, None)  # type: ignore[arg-type]
+        view.picks["A"].append("Wolf")
+
+        team_b_options = view.available_options(Team3DraftStep("B", DraftActionType.PICK, PickType.CLEAR))
+        team_a_options = view.available_options(Team3DraftStep("A", DraftActionType.PICK, PickType.CLEAR))
+
+        self.assertIn("Wolf", team_b_options)
+        self.assertNotIn("Wolf", team_a_options)
+
+        view.bans.append("Lynx")
+        self.assertNotIn("Lynx", view.available_options(Team3DraftStep("B", DraftActionType.PICK, PickType.CLEAR)))
 
 
 if __name__ == "__main__":
