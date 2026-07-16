@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from discord.ext import commands
 
@@ -5,6 +7,12 @@ from bot.cogs import admin, bear, blacklist, draft, matchmaking, registration, t
 from bot.config import Settings, load_settings
 from bot.database.session import init_database
 from bot.services.draft_service import configure_admins_file, load_bot_admins
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 def create_bot(settings: Settings) -> commands.Bot:

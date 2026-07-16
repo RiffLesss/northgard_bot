@@ -1,7 +1,10 @@
 import asyncio
+import json
+import logging
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -22,8 +25,11 @@ from bot.services.team3_service import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 DISPUTE_CHANNEL_ID = 1520167921194766518
 TEAM3_ANNOUNCEMENTS_CHANNEL_ID = 1521152955590508764
+TEAM3_AFTER_MATCH_VOICE_CHANNEL_ID = 1527279399005589554
 DRAFT_STEP_SECONDS = 120
 DRAFT_TIMER_UPDATE_SECONDS = 5
 ranked_queue: dict[int, QueueEntry] = {}
@@ -31,6 +37,7 @@ casual_lobbies: dict[int, list[tuple[int, ...]]] = {}
 pending_ready_checks: set[int] = set()
 team3_panel_messages: dict[int, int] = {}
 active_team3_players: set[int] = set()
+TEAM3_PANEL_MESSAGES_FILE = Path("data/team3_panel_messages.json")
 
 
 @dataclass
@@ -105,6 +112,41 @@ async def send_team3_announcement(
     await channel.send(content)
 
 
+async def edit_interaction_message(
+    interaction: discord.Interaction,
+    content: str,
+    view: discord.ui.View | None,
+) -> None:
+    if interaction.response.is_done():
+        await interaction.edit_original_response(content=content, view=view)
+        return
+    await interaction.response.edit_message(content=content, view=view)
+
+
+class LoggedView(discord.ui.View):
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        logger.error(
+            "Unhandled 3v3 UI interaction error: view=%s item=%s user_id=%s channel_id=%s",
+            self.__class__.__name__,
+            item.__class__.__name__,
+            interaction.user.id if interaction.user else None,
+            interaction.channel_id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Something went wrong. The error has been logged.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Something went wrong. The error has been logged.", ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("Failed to notify user about 3v3 UI interaction error")
+
+
 def render_team3_panel(channel_id: int) -> str:
     return (
         "# Northgard 3v3\n"
@@ -127,6 +169,39 @@ async def update_team3_panel(channel: discord.abc.Messageable, channel_id: int) 
         await message.edit(content=render_team3_panel(channel_id), view=Team3PanelView())
     except (AttributeError, discord.Forbidden, discord.NotFound):
         team3_panel_messages.pop(channel_id, None)
+        save_team3_panel_messages()
+
+
+def load_team3_panel_messages() -> None:
+    if not TEAM3_PANEL_MESSAGES_FILE.exists():
+        return
+    try:
+        with TEAM3_PANEL_MESSAGES_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Failed to load 3v3 panel message registry")
+        return
+    team3_panel_messages.clear()
+    team3_panel_messages.update({int(channel_id): int(message_id) for channel_id, message_id in data.items()})
+
+
+def save_team3_panel_messages() -> None:
+    TEAM3_PANEL_MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {str(channel_id): message_id for channel_id, message_id in team3_panel_messages.items()}
+    with TEAM3_PANEL_MESSAGES_FILE.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+
+
+async def fetch_saved_team3_panel(channel: discord.abc.Messageable, channel_id: int) -> discord.Message | None:
+    message_id = team3_panel_messages.get(channel_id)
+    if message_id is None:
+        return None
+    try:
+        return await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+    except (AttributeError, discord.Forbidden, discord.NotFound):
+        team3_panel_messages.pop(channel_id, None)
+        save_team3_panel_messages()
+        return None
 
 
 def missing_voice_members(members: list[discord.Member]) -> list[discord.Member]:
@@ -305,12 +380,53 @@ async def move_match_members(context: Team3MatchContext) -> None:
             await member.move_to(context.team2_channel, reason="3v3 match started")
 
 
+async def fetch_voice_channel(guild: discord.Guild, channel_id: int) -> discord.VoiceChannel | None:
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.Forbidden, discord.NotFound):
+            return None
+    return channel if isinstance(channel, discord.VoiceChannel) else None
+
+
+async def move_members_to_after_match_voice(context: Team3MatchContext) -> None:
+    guild = None
+    for member in [*context.team1_members, *context.team2_members]:
+        guild = member.guild
+        break
+    if guild is None:
+        return
+
+    target_channel = await fetch_voice_channel(guild, TEAM3_AFTER_MATCH_VOICE_CHANNEL_ID)
+    if target_channel is None:
+        return
+
+    for member in [*context.team1_members, *context.team2_members]:
+        if member.voice is None or member.voice.channel is None:
+            continue
+        try:
+            await member.move_to(target_channel, reason="3v3 match finished")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+def channel_has_match_members(channel: discord.abc.GuildChannel | None) -> bool:
+    if not isinstance(channel, discord.VoiceChannel):
+        return False
+    return bool(channel.members)
+
+
 async def cleanup_match_resources(context: Team3MatchContext) -> None:
+    await move_members_to_after_match_voice(context)
+
     channels: list[discord.abc.GuildChannel | None] = [context.team1_channel, context.team2_channel]
     if context.managed_text_channel:
         channels.append(context.text_channel)
     for channel in channels:
         if channel is not None:
+            if channel_has_match_members(channel):
+                continue
             try:
                 await channel.delete(reason="3v3 match finished")
             except (discord.Forbidden, discord.NotFound):
@@ -323,7 +439,7 @@ async def cleanup_match_resources(context: Team3MatchContext) -> None:
                 pass
 
 
-class Team3DraftView(discord.ui.View):
+class Team3DraftView(LoggedView):
     def __init__(self, context: Team3MatchContext, channel: discord.abc.Messageable, on_finish):
         super().__init__(timeout=None)
         self.context = context
@@ -332,6 +448,7 @@ class Team3DraftView(discord.ui.View):
         self.step_index = 0
         self.bans: list[str] = []
         self.picks: dict[str, list[str]] = {"A": [], "B": []}
+        self.draft_results: list[str] = []
         self.message: discord.Message | None = None
         self.step_deadline = time.monotonic() + DRAFT_STEP_SECONDS
         self.timer_task: asyncio.Task | None = None
@@ -384,32 +501,54 @@ class Team3DraftView(discord.ui.View):
         seconds = self.remaining_seconds()
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
+    def format_clans(self, clans: list[str]) -> str:
+        return " · ".join(f"`{clan}`" for clan in clans) if clans else "-"
+
+    def render_draft_table(self) -> str:
+        lines = []
+        for index, draft_step in enumerate(TEAM3_DRAFT_STEPS):
+            label = f"{draft_step.side} {draft_step.action_type.value} {draft_step.pick_type.value}"
+            if index < len(self.draft_results):
+                icon = "🚫" if draft_step.action_type == DraftActionType.BAN else "✅"
+                value = f"{icon} `{self.draft_results[index]}`"
+            elif index == self.step_index:
+                value = "⏳ waiting"
+            else:
+                value = "·"
+            lines.append(f"{label:<13} -> {value}")
+        return "\n".join(lines)
+
     def render(self) -> str:
         step = self.current_step()
-        phase = "Draft finished" if step is None else f"Team {step.side}: {step.action_type.value} {step.pick_type.value}"
-        available_clear = ", ".join(self.clan_pool(PickType.CLEAR)) or "-"
-        available_eco = ", ".join(self.clan_pool(PickType.ECO)) or "-"
+        phase = "Draft finished" if step is None else f"Team {step.side}: **{step.action_type.value} {step.pick_type.value}**"
+        available_clear = self.format_clans(self.clan_pool(PickType.CLEAR))
+        available_eco = self.format_clans(self.clan_pool(PickType.ECO))
         return (
-            f"# 3v3 Draft · Match #{self.context.match_id} · Game {self.context.game_number}\n"
+            f"# ⚔️ 3v3 Draft · Match #{self.context.match_id} · Game {self.context.game_number}\n\n"
+            f"## 👥 Teams\n"
             f"**Series score:** {series_score(self.context)}\n"
             f"**Team A:** {member_names(self.context.team1_members)}\n"
             f"**Team B:** {member_names(self.context.team2_members)}\n"
             f"**Draft side A:** {member_names(self.side_members('A'))}\n"
             f"**Draft side B:** {member_names(self.side_members('B'))}\n\n"
-            f"**Phase:** {phase}\n"
-            f"**Time left for action:** {self.remaining_text() if step is not None else '-'}\n"
-            f"**Bans:** {', '.join(self.bans) or '-'}\n"
-            f"**Draft side A picks:** {', '.join(self.picks['A']) or '-'}\n"
-            f"**Draft side B picks:** {', '.join(self.picks['B']) or '-'}\n\n"
+            f"## ⏳ Current Action\n"
+            f"{phase}\n"
+            f"Time left: **{self.remaining_text() if step is not None else '-'}**\n\n"
+            f"## 📋 Draft Table\n"
+            f"```text\n{self.render_draft_table()}\n```\n"
+            f"## 🚫 Bans\n"
+            f"{self.format_clans(self.bans)}\n\n"
+            f"## ✅ Available Picks\n"
             f"**Available clear:** {available_clear}\n"
-            f"**Available eco:** {available_eco}"
+            f"**Available eco:** {available_eco}\n\n"
+            f"⬇️ Choose a clan from the menu below."
         )
-
     async def record_current_step(self, step: Team3DraftStep, clan: str) -> None:
         if step.action_type == DraftActionType.BAN:
             self.bans.append(clan)
         else:
             self.picks[step.side].append(clan)
+        self.draft_results.append(clan)
 
         session_factory = get_session_factory()
         async with session_factory() as session:
@@ -428,7 +567,7 @@ class Team3DraftView(discord.ui.View):
             self.finished = True
             self.cancel_timer()
             if interaction is not None:
-                await interaction.response.edit_message(content=self.render(), view=None)
+                await edit_interaction_message(interaction, self.render(), None)
             elif self.message is not None:
                 await self.message.edit(content=self.render(), view=None)
             await self.on_finish(self.channel, self.context)
@@ -438,7 +577,7 @@ class Team3DraftView(discord.ui.View):
         self.step_deadline = time.monotonic() + DRAFT_STEP_SECONDS
         self.start_timer()
         if interaction is not None:
-            await interaction.response.edit_message(content=self.render(), view=self)
+            await edit_interaction_message(interaction, self.render(), self)
         elif self.message is not None:
             await self.message.edit(content=self.render(), view=self)
 
@@ -456,6 +595,7 @@ class Team3DraftView(discord.ui.View):
                 await interaction.response.send_message("This clan is not available right now.", ephemeral=True)
                 return
 
+            await interaction.response.defer()
             self.cancel_timer()
             await self.record_current_step(step, clan)
             self.step_index += 1
@@ -520,7 +660,7 @@ class Team3ClanSelect(discord.ui.Select):
         await view.handle_pick(interaction, self.values[0])
 
 
-class ResultConfirmView(discord.ui.View):
+class ResultConfirmView(LoggedView):
     def __init__(self, bot: commands.Bot, context: Team3MatchContext):
         super().__init__(timeout=result_timeout_seconds(context.best_of))
         self.bot = bot
@@ -600,7 +740,7 @@ class ResultConfirmView(discord.ui.View):
         await self.vote(interaction, self.context.team2_id)
 
 
-class ReadyCheckView(discord.ui.View):
+class ReadyCheckView(LoggedView):
     def __init__(self, members: list[discord.Member], title: str):
         super().__init__(timeout=60)
         self.members = members
@@ -731,7 +871,7 @@ async def cancel_team3_match(context: Team3MatchContext, reason: str) -> None:
     await cleanup_match_resources(context)
 
 
-class DisputeResolveView(discord.ui.View):
+class DisputeResolveView(LoggedView):
     def __init__(self, bot: commands.Bot, context: Team3MatchContext):
         super().__init__(timeout=None)
         self.bot = bot
@@ -850,7 +990,7 @@ async def build_context(
     )
 
 
-class Team3PanelView(discord.ui.View):
+class Team3PanelView(LoggedView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1164,17 +1304,28 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
+    load_team3_panel_messages()
     bot.add_view(Team3PanelView())
 
     @bot.tree.command(name="team3_panel", description="Create the 3v3 matchmaking panel")
     @app_commands.default_permissions(manage_guild=True)
     async def team3_panel(interaction: discord.Interaction) -> None:
-        if interaction.channel_id is None:
+        if interaction.channel_id is None or interaction.channel is None:
             await interaction.response.send_message("Could not determine the channel.", ephemeral=True)
             return
+        existing_message = await fetch_saved_team3_panel(interaction.channel, interaction.channel_id)
+        if existing_message is not None:
+            await existing_message.edit(content=render_team3_panel(interaction.channel_id), view=Team3PanelView())
+            await interaction.response.send_message(
+                f"3v3 panel is already active and has been refreshed: {existing_message.jump_url}",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.send_message(render_team3_panel(interaction.channel_id), view=Team3PanelView())
         message = await interaction.original_response()
         team3_panel_messages[interaction.channel_id] = message.id
+        save_team3_panel_messages()
 
     @bot.tree.command(name="tournament_3v3_start", description="Start a tournament 3v3 draft")
     @app_commands.describe(
