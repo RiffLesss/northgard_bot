@@ -3,6 +3,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 
 import discord
 from discord import app_commands
@@ -15,6 +16,8 @@ from bot.models.ncl import NclTeam
 from bot.repositories.clan_repository import ClanRepository
 from bot.repositories.ncl_repository import NclTeamRepository
 from bot.repositories.user_repository import UserRepository
+from bot.services.draft_service import is_admin
+from bot.services.ncl_service import generate_ncl_schedule, ncl_rating_update, next_monday
 
 
 logger = logging.getLogger(__name__)
@@ -46,10 +49,13 @@ class ScrimContext:
     channel: discord.TextChannel
     team_a_role: discord.Role
     team_b_role: discord.Role
+    team_a_ncl_id: int
+    team_b_ncl_id: int
     team_a_members: list[discord.Member]
     team_b_members: list[discord.Member]
     clear_clans: list[str]
     eco_clans: list[str]
+    scheduled_match_id: int | None = None
     game_number: int = 1
     team_a_score: int = 0
     team_b_score: int = 0
@@ -81,6 +87,7 @@ SCRIM_DRAFT_STEPS = [
 ]
 
 active_scrim_channels: set[int] = set()
+active_ncl_match_ids: set[int] = set()
 
 
 class LoggedView(discord.ui.View):
@@ -107,8 +114,18 @@ def channel_name(name: str) -> str:
     return cleaned.strip("-")[:90] or "ncl-team"
 
 
-def role_members(role: discord.Role) -> list[discord.Member]:
-    return [member for member in role.members if not member.bot]
+async def fetch_ncl_team_members(guild: discord.Guild, team: NclTeam) -> list[discord.Member]:
+    members: list[discord.Member] = []
+    for team_member in team.members:
+        member = guild.get_member(team_member.user.discord_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(team_member.user.discord_id)
+            except discord.NotFound:
+                member = None
+        if member is not None and not member.bot:
+            members.append(member)
+    return members
 
 
 def team_mentions(members: list[discord.Member]) -> str:
@@ -182,6 +199,35 @@ def series_score(context: ScrimContext) -> str:
     return f"{context.team_a_role.name} {context.team_a_score}:{context.team_b_score} {context.team_b_role.name}"
 
 
+def can_manage_ncl(member: discord.Member) -> bool:
+    return is_admin(member) or member.guild_permissions.manage_guild
+
+
+def is_match_participant(member: discord.Member, *roles: discord.Role) -> bool:
+    return any(role in member.roles for role in roles)
+
+
+def ordinal(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def format_week_range(week_start: date, week_end: date) -> str:
+    if week_start.month == week_end.month:
+        return f"{week_start.strftime('%B')} {ordinal(week_start.day)} - {week_end.strftime('%B')} {ordinal(week_end.day)}"
+    return f"{week_start.strftime('%B')} {ordinal(week_start.day)} - {week_end.strftime('%B')} {ordinal(week_end.day)}"
+
+
+async def role_for_ncl_team(guild: discord.Guild, team: NclTeam) -> discord.Role | None:
+    role = guild.get_role(team.discord_role_id)
+    if role is not None:
+        return role
+    return None
+
+
 class ScrimAcceptView(LoggedView):
     def __init__(self, challenger_role: discord.Role, target_role: discord.Role):
         super().__init__(timeout=SCRIM_ACCEPT_SECONDS)
@@ -206,6 +252,47 @@ class ScrimAcceptView(LoggedView):
             view=self,
         )
         self.stop()
+
+
+class NclMatchReadyView(LoggedView):
+    def __init__(self, team_a_role: discord.Role, team_b_role: discord.Role):
+        super().__init__(timeout=SCRIM_ACCEPT_SECONDS)
+        self.team_a_role = team_a_role
+        self.team_b_role = team_b_role
+        self.team_a_ready = False
+        self.team_b_ready = False
+
+    def render(self) -> str:
+        return (
+            f"{self.team_a_role.mention} vs {self.team_b_role.mention}\n"
+            "Scheduled NCL match ready-check.\n\n"
+            f"**{self.team_a_role.name}:** {'ready' if self.team_a_ready else 'waiting'}\n"
+            f"**{self.team_b_role.name}:** {'ready' if self.team_b_ready else 'waiting'}\n\n"
+            "At least one player from each team must accept within 2 minutes."
+        )
+
+    def accepted(self) -> bool:
+        return self.team_a_ready and self.team_b_ready
+
+    @discord.ui.button(label="Ready", style=discord.ButtonStyle.success)
+    async def ready(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This button is only available on a server.", ephemeral=True)
+            return
+        if self.team_a_role in interaction.user.roles:
+            self.team_a_ready = True
+        elif self.team_b_role in interaction.user.roles:
+            self.team_b_ready = True
+        else:
+            await interaction.response.send_message("Only match participants can accept this ready-check.", ephemeral=True)
+            return
+        if self.accepted():
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(content=self.render(), view=self)
+            self.stop()
+            return
+        await interaction.response.edit_message(content=self.render(), view=self)
 
 
 class ScrimClanSelect(discord.ui.Select):
@@ -551,6 +638,7 @@ class ScrimResultView(LoggedView):
             self.context.team_b_score += 1
         if max(self.context.team_a_score, self.context.team_b_score) >= wins_needed():
             active_scrim_channels.discard(self.context.channel.id)
+            await finish_scheduled_ncl_match_if_needed(self.context)
             await self.context.channel.send(
                 f"🏁 Scrim finished.\n"
                 f"Final score: **{series_score(self.context)}**."
@@ -582,6 +670,44 @@ async def start_scrim_draft(bot: commands.Bot, context: ScrimContext) -> None:
     view.start_timer()
 
 
+async def finish_scheduled_ncl_match_if_needed(context: ScrimContext) -> None:
+    if context.scheduled_match_id is None:
+        return
+    active_ncl_match_ids.discard(context.scheduled_match_id)
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        teams = NclTeamRepository(session)
+        match = await teams.get_match_by_id(context.scheduled_match_id)
+        if match is None or match.played_at is not None:
+            return
+        if context.team_a_ncl_id == match.team1_id:
+            team1_wins = context.team_a_score
+            team2_wins = context.team_b_score
+        else:
+            team1_wins = context.team_b_score
+            team2_wins = context.team_a_score
+        team1_elo_after, team2_elo_after = ncl_rating_update(
+            match.team1.elo,
+            match.team2.elo,
+            team1_wins,
+            team2_wins,
+        )
+        await teams.finish_match(
+            match=match,
+            winner_team_id=context.team_a_ncl_id if context.team_a_score > context.team_b_score else context.team_b_ncl_id,
+            team1_game_wins=team1_wins,
+            team2_game_wins=team2_wins,
+            team1_elo_after=team1_elo_after,
+            team2_elo_after=team2_elo_after,
+        )
+        await session.commit()
+        await context.channel.send(
+            "NCL scheduled match saved.\n"
+            f"Elo: **{match.team1.team_name}** {match.team1_elo_before} -> {team1_elo_after}, "
+            f"**{match.team2.team_name}** {match.team2_elo_before} -> {team2_elo_after}."
+        )
+
+
 async def create_scrim_channel(guild: discord.Guild, team_a: discord.Role, team_b: discord.Role) -> discord.TextChannel:
     category = await get_ncl_category(guild)
     overwrites = {
@@ -596,6 +722,52 @@ async def create_scrim_channel(guild: discord.Guild, team_a: discord.Role, team_
         category=category,
         reason="NCL scrim",
     )
+
+
+def render_ncl_schedule(matches: list) -> str:
+    if not matches:
+        return "NCL schedule is empty."
+    lines = ["# NCL Schedule"]
+    weeks = sorted({match.week_number for match in matches})
+    for week_number in weeks:
+        week_matches = [match for match in matches if match.week_number == week_number]
+        week_start = week_matches[0].week_start
+        week_end = week_matches[0].week_end
+        lines.append("")
+        lines.append(f"## Week {week_number} ({format_week_range(week_start, week_end)})")
+        team_ids = sorted({match.team1_id for match in week_matches} | {match.team2_id for match in week_matches})
+        for team_id in team_ids:
+            team_matches = [match for match in week_matches if match.team1_id == team_id or match.team2_id == team_id]
+            team = team_matches[0].team1 if team_matches[0].team1_id == team_id else team_matches[0].team2
+            lines.append("")
+            lines.append(f"### {team.team_name}")
+            for match in team_matches:
+                status = " ✅" if match.played_at is not None else ""
+                lines.append(f"<@&{match.team1.discord_role_id}> vs <@&{match.team2.discord_role_id}>{status}")
+    return "\n".join(lines)
+
+
+async def send_long_response(interaction: discord.Interaction, content: str) -> None:
+    chunks = []
+    current = ""
+    for line in content.splitlines():
+        next_value = f"{current}\n{line}" if current else line
+        if len(next_value) > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current = next_value
+    if current:
+        chunks.append(current)
+
+    if not chunks:
+        chunks = ["-"]
+    if interaction.response.is_done():
+        await interaction.followup.send(chunks[0])
+    else:
+        await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
@@ -700,6 +872,152 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             ephemeral=True,
         )
 
+    @bot.tree.command(name="seed", description="Set NCL tournament seed for a team")
+    @app_commands.describe(team_role="NCL team role", seed="Positive seed number")
+    @app_commands.default_permissions(manage_guild=True)
+    async def seed(interaction: discord.Interaction, team_role: discord.Role, seed: int) -> None:
+        if not is_database_configured():
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
+            return
+        if seed < 1:
+            await interaction.response.send_message("Seed must be a positive number.", ephemeral=True)
+            return
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            teams = NclTeamRepository(session)
+            team = await teams.get_by_role_id(team_role.id)
+            if team is None:
+                await interaction.response.send_message("This role is not a registered NCL team.", ephemeral=True)
+                return
+            existing_seed_team = await teams.get_by_seed(seed)
+            if existing_seed_team is not None and existing_seed_team.id != team.id:
+                await interaction.response.send_message(
+                    f"Seed {seed} is already used by **{existing_seed_team.team_name}**.",
+                    ephemeral=True,
+                )
+                return
+            await teams.set_seed(team, seed)
+            await session.commit()
+        await interaction.response.send_message(f"Seed set: {team_role.mention} -> **{seed}**.", ephemeral=True)
+
+    @bot.tree.command(name="create_schedule", description="Generate NCL double round-robin schedule")
+    @app_commands.default_permissions(manage_guild=True)
+    async def create_schedule(interaction: discord.Interaction) -> None:
+        if not is_database_configured():
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            teams = NclTeamRepository(session)
+            if await teams.has_played_matches():
+                await interaction.followup.send("Cannot recreate schedule after at least one NCL match has been played.")
+                return
+            seeded_teams = await teams.list_seeded()
+            try:
+                generated = generate_ncl_schedule(
+                    [team.id for team in seeded_teams],
+                    next_monday(date.today()),
+                )
+            except ValueError as error:
+                await interaction.followup.send(str(error))
+                return
+            await teams.clear_schedule()
+            for match in generated:
+                await teams.create_match(
+                    week_number=match.week_number,
+                    week_start=match.week_start,
+                    week_end=match.week_end,
+                    team1_id=match.team1_id,
+                    team2_id=match.team2_id,
+                )
+            await session.commit()
+            matches = await teams.list_matches()
+        await send_long_response(interaction, render_ncl_schedule(matches))
+
+    @bot.tree.command(name="ncl_schedule", description="Show current NCL schedule")
+    async def ncl_schedule(interaction: discord.Interaction) -> None:
+        if not is_database_configured():
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
+            return
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            matches = await NclTeamRepository(session).list_matches()
+        await send_long_response(interaction, render_ncl_schedule(matches))
+
+    @bot.tree.command(name="start_match", description="Start this week's scheduled NCL match")
+    @app_commands.describe(team1="First NCL team role", team2="Second NCL team role")
+    async def start_match(interaction: discord.Interaction, team1: discord.Role, team2: discord.Role) -> None:
+        if not is_database_configured():
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
+            return
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command is only available on a server.", ephemeral=True)
+            return
+        if team1.id == team2.id:
+            await interaction.response.send_message("Choose two different teams.", ephemeral=True)
+            return
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            teams = NclTeamRepository(session)
+            ncl_team1 = await teams.get_by_role_id(team1.id)
+            ncl_team2 = await teams.get_by_role_id(team2.id)
+            if ncl_team1 is None or ncl_team2 is None:
+                await interaction.response.send_message("Both roles must be registered NCL teams.", ephemeral=True)
+                return
+            match = await teams.find_current_week_match(ncl_team1.id, ncl_team2.id, date.today())
+        if match is None:
+            await interaction.response.send_message("There is no unplayed scheduled match between these teams this week.", ephemeral=True)
+            return
+        if match.id in active_ncl_match_ids:
+            await interaction.response.send_message("This scheduled match is already active.", ephemeral=True)
+            return
+        if not can_manage_ncl(interaction.user) and not is_match_participant(interaction.user, team1, team2):
+            await interaction.response.send_message("Only an organizer or a participant of one of these teams can start this match.", ephemeral=True)
+            return
+        team1_members = await fetch_ncl_team_members(interaction.guild, ncl_team1)
+        team2_members = await fetch_ncl_team_members(interaction.guild, ncl_team2)
+        if len(team1_members) < 3 or len(team2_members) < 3:
+            await interaction.response.send_message(
+                "Both NCL teams must have at least 3 registered server members in the database.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            channel = await create_scrim_channel(interaction.guild, team1, team2)
+        except discord.Forbidden:
+            await interaction.followup.send("The bot cannot create a private match channel.", ephemeral=True)
+            return
+
+        active_ncl_match_ids.add(match.id)
+        view = NclMatchReadyView(team1, team2)
+        await channel.send(view.render(), view=view)
+        await interaction.followup.send(f"NCL match ready-check created: {channel.mention}", ephemeral=True)
+        await view.wait()
+        if not view.accepted():
+            active_ncl_match_ids.discard(match.id)
+            await channel.send("NCL match ready-check expired.")
+            return
+
+        clear_clans, eco_clans = await load_clan_pools()
+        context = ScrimContext(
+            guild=interaction.guild,
+            channel=channel,
+            team_a_role=team1,
+            team_b_role=team2,
+            team_a_ncl_id=ncl_team1.id,
+            team_b_ncl_id=ncl_team2.id,
+            team_a_members=team1_members,
+            team_b_members=team2_members,
+            clear_clans=clear_clans,
+            eco_clans=eco_clans,
+            scheduled_match_id=match.id,
+        )
+        active_scrim_channels.add(channel.id)
+        await start_scrim_draft(bot, context)
+
     @bot.tree.command(name="scrim", description="Challenge another NCL team to a bo5 scrim")
     @app_commands.describe(team_role="Team role to challenge")
     async def scrim(interaction: discord.Interaction, team_role: discord.Role) -> None:
@@ -730,10 +1048,13 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if challenger_role is None:
             await interaction.response.send_message("Your registered NCL team role was not found on Discord.", ephemeral=True)
             return
-        challenger_members = role_members(challenger_role)
-        target_members = role_members(team_role)
+        challenger_members = await fetch_ncl_team_members(interaction.guild, challenger_team)
+        target_members = await fetch_ncl_team_members(interaction.guild, target_team)
         if len(challenger_members) < 3 or len(target_members) < 3:
-            await interaction.response.send_message("Both NCL teams must have at least 3 members.", ephemeral=True)
+            await interaction.response.send_message(
+                "Both NCL teams must have at least 3 registered server members in the database.",
+                ephemeral=True,
+            )
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -761,6 +1082,8 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             channel=channel,
             team_a_role=challenger_role,
             team_b_role=team_role,
+            team_a_ncl_id=challenger_team.id,
+            team_b_ncl_id=target_team.id,
             team_a_members=challenger_members,
             team_b_members=target_members,
             clear_clans=clear_clans,

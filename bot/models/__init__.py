@@ -4,7 +4,7 @@ from bot.models.blacklist import PlayerBlacklist
 from bot.models.clan import Clan
 from bot.models.draft_action import DraftAction
 from bot.models.match import Match
-from bot.models.ncl import NclTeam, NclTeamMember
+from bot.models.ncl import NclMatch, NclTeam, NclTeamMember
 from bot.models.team import Team, TeamMember
 from bot.models.user import BotAdmin, User
 
@@ -20,6 +20,7 @@ __all__ = [
     "Match",
     "NclTeam",
     "NclTeamMember",
+    "NclMatch",
     "PlayerBlacklist",
     "Team",
     "TeamMember",
