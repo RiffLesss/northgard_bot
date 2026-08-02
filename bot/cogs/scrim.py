@@ -882,23 +882,24 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if seed < 1:
             await interaction.response.send_message("Seed must be a positive number.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         session_factory = get_session_factory()
         async with session_factory() as session:
             teams = NclTeamRepository(session)
             team = await teams.get_by_role_id(team_role.id)
             if team is None:
-                await interaction.response.send_message("This role is not a registered NCL team.", ephemeral=True)
+                await interaction.followup.send("This role is not a registered NCL team.", ephemeral=True)
                 return
             existing_seed_team = await teams.get_by_seed(seed)
             if existing_seed_team is not None and existing_seed_team.id != team.id:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"Seed {seed} is already used by **{existing_seed_team.team_name}**.",
                     ephemeral=True,
                 )
                 return
             await teams.set_seed(team, seed)
             await session.commit()
-        await interaction.response.send_message(f"Seed set: {team_role.mention} -> **{seed}**.", ephemeral=True)
+        await interaction.followup.send(f"Seed set: {team_role.mention} -> **{seed}**.", ephemeral=True)
 
     @bot.tree.command(name="create_schedule", description="Generate NCL double round-robin schedule")
     @app_commands.default_permissions(manage_guild=True)
@@ -940,6 +941,7 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if not is_database_configured():
             await interaction.response.send_message("Database is not configured.", ephemeral=True)
             return
+        await interaction.response.defer()
         session_factory = get_session_factory()
         async with session_factory() as session:
             matches = await NclTeamRepository(session).list_matches()
@@ -957,34 +959,34 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if team1.id == team2.id:
             await interaction.response.send_message("Choose two different teams.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         session_factory = get_session_factory()
         async with session_factory() as session:
             teams = NclTeamRepository(session)
             ncl_team1 = await teams.get_by_role_id(team1.id)
             ncl_team2 = await teams.get_by_role_id(team2.id)
             if ncl_team1 is None or ncl_team2 is None:
-                await interaction.response.send_message("Both roles must be registered NCL teams.", ephemeral=True)
+                await interaction.followup.send("Both roles must be registered NCL teams.", ephemeral=True)
                 return
             match = await teams.find_current_week_match(ncl_team1.id, ncl_team2.id, date.today())
         if match is None:
-            await interaction.response.send_message("There is no unplayed scheduled match between these teams this week.", ephemeral=True)
+            await interaction.followup.send("There is no unplayed scheduled match between these teams this week.", ephemeral=True)
             return
         if match.id in active_ncl_match_ids:
-            await interaction.response.send_message("This scheduled match is already active.", ephemeral=True)
+            await interaction.followup.send("This scheduled match is already active.", ephemeral=True)
             return
         if not can_manage_ncl(interaction.user) and not is_match_participant(interaction.user, team1, team2):
-            await interaction.response.send_message("Only an organizer or a participant of one of these teams can start this match.", ephemeral=True)
+            await interaction.followup.send("Only an organizer or a participant of one of these teams can start this match.", ephemeral=True)
             return
         team1_members = await fetch_ncl_team_members(interaction.guild, ncl_team1)
         team2_members = await fetch_ncl_team_members(interaction.guild, ncl_team2)
         if len(team1_members) < 3 or len(team2_members) < 3:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Both NCL teams must have at least 3 registered server members in the database.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
         try:
             channel = await create_scrim_channel(interaction.guild, team1, team2)
         except discord.Forbidden:
@@ -1027,37 +1029,37 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command is only available on a server.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         challenger_team = await ncl_team_for_member(interaction.user)
         if challenger_team is None:
-            await interaction.response.send_message("You are not a member of a registered NCL team.", ephemeral=True)
+            await interaction.followup.send("You are not a member of a registered NCL team.", ephemeral=True)
             return
         session_factory = get_session_factory()
         async with session_factory() as session:
             target_team = await NclTeamRepository(session).get_by_role_id(team_role.id)
         if target_team is None:
-            await interaction.response.send_message("The challenged role is not a registered NCL team.", ephemeral=True)
+            await interaction.followup.send("The challenged role is not a registered NCL team.", ephemeral=True)
             return
         if team_role.id == challenger_team.discord_role_id:
-            await interaction.response.send_message("You cannot challenge your own team.", ephemeral=True)
+            await interaction.followup.send("You cannot challenge your own team.", ephemeral=True)
             return
         if interaction.channel_id in active_scrim_channels:
-            await interaction.response.send_message("There is already an active scrim in this channel.", ephemeral=True)
+            await interaction.followup.send("There is already an active scrim in this channel.", ephemeral=True)
             return
 
         challenger_role = interaction.guild.get_role(challenger_team.discord_role_id)
         if challenger_role is None:
-            await interaction.response.send_message("Your registered NCL team role was not found on Discord.", ephemeral=True)
+            await interaction.followup.send("Your registered NCL team role was not found on Discord.", ephemeral=True)
             return
         challenger_members = await fetch_ncl_team_members(interaction.guild, challenger_team)
         target_members = await fetch_ncl_team_members(interaction.guild, target_team)
         if len(challenger_members) < 3 or len(target_members) < 3:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Both NCL teams must have at least 3 registered server members in the database.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
         try:
             channel = await create_scrim_channel(interaction.guild, challenger_role, team_role)
         except discord.Forbidden:
