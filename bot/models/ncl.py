@@ -12,7 +12,6 @@ class NclTeam(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     team_name: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     elo: Mapped[int] = mapped_column(Integer, nullable=False, default=500, server_default="500")
-    seed: Mapped[int | None] = mapped_column(Integer, unique=True)
     discord_role_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
     text_channel_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
     voice_channel_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)

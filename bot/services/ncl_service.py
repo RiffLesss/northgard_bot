@@ -48,7 +48,7 @@ def week_label(week_start: date) -> tuple[date, date]:
 
 def round_robin_rounds(team_ids: list[int]) -> list[list[tuple[int, int]]]:
     if len(team_ids) < 4 or len(team_ids) % 2 != 0:
-        raise ValueError("NCL schedule needs an even number of seeded teams, minimum 4.")
+        raise ValueError("NCL schedule needs an even number of NCL teams, minimum 4.")
 
     teams = team_ids.copy()
     rounds = []

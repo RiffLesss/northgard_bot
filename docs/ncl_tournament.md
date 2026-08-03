@@ -8,29 +8,11 @@ Important fields:
 
 - `team_name` - team name;
 - `elo` - current team rating, default `500`;
-- `seed` - manual tournament seeding;
 - `discord_role_id` - Discord team role;
 - `text_channel_id` - private team text channel;
 - `voice_channel_id` - private team voice channel.
 
 Team members are stored in `ncl_team_members`. Every player must already be registered with `/register` before they can be added to an NCL team.
-
-## Seeding
-
-Organizers set team seed with:
-
-```text
-/seed @team seed
-```
-
-Rules:
-
-- `@team` must be a registered NCL team role;
-- `seed` must be a positive integer;
-- one seed can belong to only one team;
-- setting seed again for the same team updates it.
-
-Teams with `seed = NULL` are not included in generated tournament schedule.
 
 ## Schedule
 
@@ -40,13 +22,13 @@ Organizers generate the schedule with:
 /create_schedule
 ```
 
-The bot uses all NCL teams with a seed, sorted by seed.
+The bot uses all registered NCL teams, sorted by team name for stable generation.
 Existing generated schedule can be recreated only before any NCL match has been played.
 
 Schedule rules:
 
-- even number of seeded teams is required;
-- at least 4 seeded teams are required;
+- even number of NCL teams is required;
+- at least 4 NCL teams are required;
 - every team plays 2 matches each week;
 - every pair of teams plays exactly 2 matches across the schedule;
 - the same pair cannot play twice in one week.
@@ -60,6 +42,26 @@ The current schedule can be shown with:
 ```
 
 Played matches are marked with `✅`.
+
+## Leaderboard
+
+The NCL team leaderboard is shown with:
+
+```text
+/ncl_leaderboard
+```
+
+This command can be used only in channel `1533831143034454127`.
+
+The leaderboard message is reused and updated instead of creating duplicates. It is also refreshed automatically whenever a scheduled NCL match is completed.
+
+Leaderboard columns:
+
+- team name;
+- Elo;
+- wins count;
+- loss count;
+- maps diff, calculated as `MAPS WON - MAPS LOST`.
 
 ## Starting A Scheduled Match
 

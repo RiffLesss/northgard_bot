@@ -21,9 +21,6 @@ class NclTeamRepository:
     async def get_by_name(self, team_name: str) -> NclTeam | None:
         return await self.session.scalar(select(NclTeam).where(NclTeam.team_name == team_name))
 
-    async def get_by_seed(self, seed: int) -> NclTeam | None:
-        return await self.session.scalar(select(NclTeam).where(NclTeam.seed == seed))
-
     async def get_for_user_id(self, user_id: int) -> NclTeam | None:
         return await self.session.scalar(
             select(NclTeam)
@@ -55,12 +52,8 @@ class NclTeamRepository:
         await self.session.flush()
         return team
 
-    async def set_seed(self, team: NclTeam, seed: int) -> None:
-        team.seed = seed
-        await self.session.flush()
-
-    async def list_seeded(self) -> list[NclTeam]:
-        result = await self.session.scalars(select(NclTeam).where(NclTeam.seed.is_not(None)).order_by(NclTeam.seed))
+    async def list_teams(self) -> list[NclTeam]:
+        result = await self.session.scalars(select(NclTeam).order_by(NclTeam.team_name))
         return list(result)
 
     async def clear_schedule(self) -> None:

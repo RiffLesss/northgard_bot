@@ -23,6 +23,7 @@ from bot.services.ncl_service import generate_ncl_schedule, ncl_rating_update, n
 logger = logging.getLogger(__name__)
 
 NCL_CATEGORY_ID = 1526212599820062982
+NCL_LEADERBOARD_CHANNEL_ID = 1533831143034454127
 SCRIM_ACCEPT_SECONDS = 120
 SCRIM_DRAFT_STEP_SECONDS = 120
 SCRIM_DRAFT_TIMER_UPDATE_SECONDS = 5
@@ -88,6 +89,7 @@ SCRIM_DRAFT_STEPS = [
 
 active_scrim_channels: set[int] = set()
 active_ncl_match_ids: set[int] = set()
+ncl_leaderboard_message_id: int | None = None
 
 
 class LoggedView(discord.ui.View):
@@ -638,7 +640,7 @@ class ScrimResultView(LoggedView):
             self.context.team_b_score += 1
         if max(self.context.team_a_score, self.context.team_b_score) >= wins_needed():
             active_scrim_channels.discard(self.context.channel.id)
-            await finish_scheduled_ncl_match_if_needed(self.context)
+            await finish_scheduled_ncl_match_if_needed(self.bot, self.context)
             await self.context.channel.send(
                 f"🏁 Scrim finished.\n"
                 f"Final score: **{series_score(self.context)}**."
@@ -670,7 +672,7 @@ async def start_scrim_draft(bot: commands.Bot, context: ScrimContext) -> None:
     view.start_timer()
 
 
-async def finish_scheduled_ncl_match_if_needed(context: ScrimContext) -> None:
+async def finish_scheduled_ncl_match_if_needed(bot: commands.Bot, context: ScrimContext) -> None:
     if context.scheduled_match_id is None:
         return
     active_ncl_match_ids.discard(context.scheduled_match_id)
@@ -706,6 +708,7 @@ async def finish_scheduled_ncl_match_if_needed(context: ScrimContext) -> None:
             f"Elo: **{match.team1.team_name}** {match.team1_elo_before} -> {team1_elo_after}, "
             f"**{match.team2.team_name}** {match.team2_elo_before} -> {team2_elo_after}."
         )
+    await refresh_ncl_leaderboard_message(bot)
 
 
 async def create_scrim_channel(guild: discord.Guild, team_a: discord.Role, team_b: discord.Role) -> discord.TextChannel:
@@ -745,6 +748,113 @@ def render_ncl_schedule(matches: list) -> str:
                 status = " ✅" if match.played_at is not None else ""
                 lines.append(f"<@&{match.team1.discord_role_id}> vs <@&{match.team2.discord_role_id}>{status}")
     return "\n".join(lines)
+
+
+def ncl_leaderboard_rows(teams: list[NclTeam], matches: list) -> list[dict[str, object]]:
+    stats = {
+        team.id: {
+            "team": team,
+            "wins": 0,
+            "losses": 0,
+            "maps_won": 0,
+            "maps_lost": 0,
+        }
+        for team in teams
+    }
+    for match in matches:
+        if match.played_at is None or match.winner_team_id is None:
+            continue
+        if match.team1_id not in stats or match.team2_id not in stats:
+            continue
+        stats[match.team1_id]["maps_won"] += match.team1_game_wins
+        stats[match.team1_id]["maps_lost"] += match.team2_game_wins
+        stats[match.team2_id]["maps_won"] += match.team2_game_wins
+        stats[match.team2_id]["maps_lost"] += match.team1_game_wins
+        if match.winner_team_id == match.team1_id:
+            stats[match.team1_id]["wins"] += 1
+            stats[match.team2_id]["losses"] += 1
+        elif match.winner_team_id == match.team2_id:
+            stats[match.team2_id]["wins"] += 1
+            stats[match.team1_id]["losses"] += 1
+
+    rows = list(stats.values())
+    rows.sort(
+        key=lambda row: (
+            -int(row["team"].elo),
+            -int(row["wins"]),
+            -(int(row["maps_won"]) - int(row["maps_lost"])),
+            str(row["team"].team_name).lower(),
+        )
+    )
+    return rows
+
+
+def render_ncl_leaderboard(teams: list[NclTeam], matches: list) -> str:
+    rows = ncl_leaderboard_rows(teams, matches)
+    lines = [
+        "# NCL Leaderboard",
+        "",
+        "```text",
+        f"{'#':<3} {'Team':<24} {'Elo':>5} {'W':>3} {'L':>3} {'Maps':>6}",
+    ]
+    for index, row in enumerate(rows, start=1):
+        team = row["team"]
+        maps_diff = int(row["maps_won"]) - int(row["maps_lost"])
+        lines.append(
+            f"{index:<3} {team.team_name[:24]:<24} {team.elo:>5} "
+            f"{int(row['wins']):>3} {int(row['losses']):>3} {maps_diff:>+6}"
+        )
+    lines.append("```")
+    if not rows:
+        lines.append("_No NCL teams yet._")
+    return "\n".join(lines)
+
+
+async def build_ncl_leaderboard_text() -> str:
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        teams = NclTeamRepository(session)
+        return render_ncl_leaderboard(await teams.list_teams(), await teams.list_matches())
+
+
+async def find_existing_ncl_leaderboard_message(channel: discord.TextChannel, bot_user: discord.ClientUser | None) -> discord.Message | None:
+    if bot_user is None:
+        return None
+    async for message in channel.history(limit=50):
+        if message.author.id == bot_user.id and message.content.startswith("# NCL Leaderboard"):
+            return message
+    return None
+
+
+async def upsert_ncl_leaderboard_message(bot: commands.Bot, channel: discord.TextChannel) -> discord.Message:
+    global ncl_leaderboard_message_id
+    text = await build_ncl_leaderboard_text()
+    message: discord.Message | None = None
+    if ncl_leaderboard_message_id is not None:
+        try:
+            message = await channel.fetch_message(ncl_leaderboard_message_id)
+        except (discord.Forbidden, discord.NotFound):
+            message = None
+    if message is None:
+        message = await find_existing_ncl_leaderboard_message(channel, bot.user)
+    if message is None:
+        message = await channel.send(text)
+    else:
+        await message.edit(content=text)
+    ncl_leaderboard_message_id = message.id
+    return message
+
+
+async def refresh_ncl_leaderboard_message(bot: commands.Bot) -> None:
+    channel = bot.get_channel(NCL_LEADERBOARD_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(NCL_LEADERBOARD_CHANNEL_ID)
+        except (discord.Forbidden, discord.NotFound):
+            return
+    if not isinstance(channel, discord.TextChannel):
+        return
+    await upsert_ncl_leaderboard_message(bot, channel)
 
 
 async def send_long_response(interaction: discord.Interaction, content: str) -> None:
@@ -872,35 +982,6 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             ephemeral=True,
         )
 
-    @bot.tree.command(name="seed", description="Set NCL tournament seed for a team")
-    @app_commands.describe(team_role="NCL team role", seed="Positive seed number")
-    @app_commands.default_permissions(manage_guild=True)
-    async def seed(interaction: discord.Interaction, team_role: discord.Role, seed: int) -> None:
-        if not is_database_configured():
-            await interaction.response.send_message("Database is not configured.", ephemeral=True)
-            return
-        if seed < 1:
-            await interaction.response.send_message("Seed must be a positive number.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            teams = NclTeamRepository(session)
-            team = await teams.get_by_role_id(team_role.id)
-            if team is None:
-                await interaction.followup.send("This role is not a registered NCL team.", ephemeral=True)
-                return
-            existing_seed_team = await teams.get_by_seed(seed)
-            if existing_seed_team is not None and existing_seed_team.id != team.id:
-                await interaction.followup.send(
-                    f"Seed {seed} is already used by **{existing_seed_team.team_name}**.",
-                    ephemeral=True,
-                )
-                return
-            await teams.set_seed(team, seed)
-            await session.commit()
-        await interaction.followup.send(f"Seed set: {team_role.mention} -> **{seed}**.", ephemeral=True)
-
     @bot.tree.command(name="create_schedule", description="Generate NCL double round-robin schedule")
     @app_commands.default_permissions(manage_guild=True)
     async def create_schedule(interaction: discord.Interaction) -> None:
@@ -914,10 +995,10 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             if await teams.has_played_matches():
                 await interaction.followup.send("Cannot recreate schedule after at least one NCL match has been played.")
                 return
-            seeded_teams = await teams.list_seeded()
+            ncl_teams = await teams.list_teams()
             try:
                 generated = generate_ncl_schedule(
-                    [team.id for team in seeded_teams],
+                    [team.id for team in ncl_teams],
                     next_monday(date.today()),
                 )
             except ValueError as error:
@@ -946,6 +1027,24 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         async with session_factory() as session:
             matches = await NclTeamRepository(session).list_matches()
         await send_long_response(interaction, render_ncl_schedule(matches))
+
+    @bot.tree.command(name="ncl_leaderboard", description="Show NCL team leaderboard")
+    async def ncl_leaderboard(interaction: discord.Interaction) -> None:
+        if not is_database_configured():
+            await interaction.response.send_message("Database is not configured.", ephemeral=True)
+            return
+        if interaction.channel_id != NCL_LEADERBOARD_CHANNEL_ID:
+            await interaction.response.send_message(
+                f"NCL leaderboard can only be used in <#{NCL_LEADERBOARD_CHANNEL_ID}>.",
+                ephemeral=True,
+            )
+            return
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("This command is only available in a text channel.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        message = await upsert_ncl_leaderboard_message(bot, interaction.channel)
+        await interaction.followup.send(f"NCL leaderboard updated: {message.jump_url}", ephemeral=True)
 
     @bot.tree.command(name="start_match", description="Start this week's scheduled NCL match")
     @app_commands.describe(team1="First NCL team role", team2="Second NCL team role")
