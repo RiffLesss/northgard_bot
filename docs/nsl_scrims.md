@@ -1,11 +1,11 @@
-# NCL Scrims
+# NSL Scrims
 
 ## Team Setup
 
 Tournament organizers create a team with:
 
 ```text
-/add_ncl_team team_name player1 player2 player3 player4
+/add_nsl_team team_name player1 player2 player3 player4
 ```
 
 `player4` is optional. The bot creates:
@@ -19,14 +19,14 @@ All selected players must already be registered with `/register`.
 
 Team metadata is stored in PostgreSQL:
 
-- `ncl_teams.team_name`;
-- `ncl_teams.elo`;
+- `nsl_teams.team_name`;
+- `nsl_teams.elo`;
 - Discord role/channel ids;
-- team membership in `ncl_team_members`.
+- team membership in `nsl_team_members`.
 
 ## Scrim Flow
 
-A player from a registered NCL team can challenge another registered NCL team:
+A player from a registered NSL team can challenge another registered NSL team:
 
 ```text
 /scrim @team_role

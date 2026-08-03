@@ -20,7 +20,7 @@ class User(Base):
     tier_placement: Mapped[int | None] = mapped_column(Integer)
 
     teams: Mapped[list["TeamMember"]] = relationship(back_populates="user")
-    ncl_teams: Mapped[list["NclTeamMember"]] = relationship(back_populates="user")
+    nsl_teams: Mapped[list["NslTeamMember"]] = relationship(back_populates="user")
     bear_tier: Mapped["BearTier | None"] = relationship(back_populates="users")
     blacklist_entries: Mapped[list["PlayerBlacklist"]] = relationship(
         foreign_keys="PlayerBlacklist.player_id",

@@ -1,8 +1,8 @@
-# NCL Tournament
+# NSL Tournament
 
 ## Teams
 
-NCL teams are stored in PostgreSQL table `ncl_teams`.
+NSL teams are stored in PostgreSQL table `nsl_teams`.
 
 Important fields:
 
@@ -12,7 +12,7 @@ Important fields:
 - `text_channel_id` - private team text channel;
 - `voice_channel_id` - private team voice channel.
 
-Team members are stored in `ncl_team_members`. Every player must already be registered with `/register` before they can be added to an NCL team.
+Team members are stored in `nsl_team_members`. Every player must already be registered with `/register` before they can be added to an NSL team.
 
 ## Schedule
 
@@ -22,13 +22,13 @@ Organizers generate the schedule with:
 /create_schedule
 ```
 
-The bot uses all registered NCL teams, sorted by team name for stable generation.
-Existing generated schedule can be recreated only before any NCL match has been played.
+The bot uses all registered NSL teams, sorted by team name for stable generation.
+Existing generated schedule can be recreated only before any NSL match has been played.
 
 Schedule rules:
 
-- even number of NCL teams is required;
-- at least 4 NCL teams are required;
+- even number of NSL teams is required;
+- at least 4 NSL teams are required;
 - every team plays 2 matches each week;
 - every pair of teams plays exactly 2 matches across the schedule;
 - the same pair cannot play twice in one week.
@@ -38,22 +38,22 @@ The first week starts on the next Monday. If the command is used on Monday, the 
 The current schedule can be shown with:
 
 ```text
-/ncl_schedule
+/nsl_schedule
 ```
 
 Played matches are marked with `✅`.
 
 ## Leaderboard
 
-The NCL team leaderboard is shown with:
+The NSL team leaderboard is shown with:
 
 ```text
-/ncl_leaderboard
+/nsl_leaderboard
 ```
 
 This command can be used only in channel `1533831143034454127`.
 
-The leaderboard message is reused and updated instead of creating duplicates. It is also refreshed automatically whenever a scheduled NCL match is completed.
+The leaderboard message is reused and updated instead of creating duplicates. It is also refreshed automatically whenever a scheduled NSL match is completed.
 
 Leaderboard columns:
 
@@ -73,7 +73,7 @@ A scheduled match is started with:
 
 The command works only when:
 
-- both roles are registered NCL teams;
+- both roles are registered NSL teams;
 - there is an unplayed scheduled match between these teams in the current week;
 - the command user is an organizer or a member of one of the two teams.
 
@@ -82,7 +82,7 @@ After the command:
 1. The bot creates a private match text channel in category `1526212599820062982`.
 2. Both teams receive a ready-check.
 3. At least one player from each team must confirm within 2 minutes.
-4. A bo5 match starts using the same draft flow as NCL scrims.
+4. A bo5 match starts using the same draft flow as NSL scrims.
 5. After each game, both teams confirm the winner.
 6. When one team reaches 3 wins, the match is saved and Elo is updated automatically.
 
@@ -105,4 +105,4 @@ Where:
 - `E_i` is expected score;
 - `S_i` is series score.
 
-The final rating is rounded to the nearest integer and saved back to `ncl_teams.elo`.
+The final rating is rounded to the nearest integer and saved back to `nsl_teams.elo`.

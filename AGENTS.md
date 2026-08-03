@@ -6,8 +6,8 @@ When adding or changing project documentation, update this index in the same cha
 ## Documentation
 
 - [3v3 Modes](docs/team3_usage.md) - how the 3v3 panel, casual queue, ranked queue, ready checks, draft flow, result confirmation, disputes, and cleanup work.
-- [NCL Scrims](docs/ncl_scrims.md) - how tournament team setup, scrim invites, bo5 draft order, fearless eco picks, magic cards, and result confirmation work.
-- [NCL Tournament](docs/ncl_tournament.md) - how NCL schedule generation, scheduled match starts, and Elo updates work.
+- [NSL Scrims](docs/nsl_scrims.md) - how tournament team setup, scrim invites, bo5 draft order, fearless eco picks, magic cards, and result confirmation work.
+- [NSL Tournament](docs/nsl_tournament.md) - how NSL schedule generation, scheduled match starts, and Elo updates work.
 
 ## Project Entry Points
 
