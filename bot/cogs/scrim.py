@@ -374,15 +374,17 @@ class ScrimDraftView(LoggedView):
 
     def clan_pool(self, step: ScrimDraftStep) -> list[str]:
         source = self.context.clear_clans if step.pick_type == PickType.CLEAR else self.context.eco_clans
-        unavailable = self.active_bans() | set(self.picks["A"]) | set(self.picks["B"])
-        if step.action_type == DraftActionType.PICK and step.pick_type == PickType.ECO:
-            unavailable |= self.fearless_eco_blocked_for_side(step.side)
-        return [clan for clan in source if clan not in unavailable]
+        return [clan for clan in source if clan not in self.active_bans()]
 
     def available_options(self, step: ScrimDraftStep) -> list[str]:
         options = self.clan_pool(step)
+        if step.action_type == DraftActionType.BAN:
+            picked_clans = set(self.picks["A"]) | set(self.picks["B"])
+            return [clan for clan in options if clan not in picked_clans]
         if step.action_type == DraftActionType.PICK:
             options = [clan for clan in options if clan not in self.picks[step.side]]
+            if step.pick_type == PickType.ECO:
+                options = [clan for clan in options if clan not in self.fearless_eco_blocked_for_side(step.side)]
         return options
 
     def refresh_items(self) -> None:
