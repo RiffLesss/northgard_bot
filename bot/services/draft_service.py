@@ -1,16 +1,15 @@
 import asyncio
-import json
+import logging
 import random
-from pathlib import Path
 
 import discord
 from discord.ext import commands
 
 from bot.database.session import get_session_factory, is_database_configured
 from bot.repositories.clan_repository import ClanRepository
+from bot.repositories.runtime_state_repository import RuntimeStateRepository
 
 
-BOT_ADMINS_FILE = Path("data/bot_admins.json")
 MASTER_ADMIN_IDS = {
     624650680778489856,
 }
@@ -48,6 +47,8 @@ DRAFT_FORMATS = {"bo1": 1, "bo3": 2, "bo5": 3}
 TIMER_UPDATE_SECONDS = 3
 
 active_drafts: dict[int, "DraftSession"] = {}
+DRAFT_STATE_PREFIX = "draft2v2:"
+logger = logging.getLogger(__name__)
 
 
 class ClanRules:
@@ -79,31 +80,23 @@ async def load_clan_rules() -> ClanRules:
         return ClanRules(all_clans, clear_clans, kingdom_clans)
 
 
-def load_bot_admins() -> None:
-    if not BOT_ADMINS_FILE.exists():
+async def load_bot_admins_from_db() -> None:
+    if not is_database_configured():
         return
+    from bot.repositories.admin_repository import AdminRepository
 
-    with BOT_ADMINS_FILE.open("r", encoding="utf-8") as file:
-        data = json.load(file)
-
-    BOT_ADMIN_IDS.update(int(user_id) for user_id in data.get("admin_ids", []))
-
-
-def save_bot_admins() -> None:
-    data = {"admin_ids": sorted(BOT_ADMIN_IDS)}
-    BOT_ADMINS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with BOT_ADMINS_FILE.open("w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
+    async with get_session_factory()() as session:
+        BOT_ADMIN_IDS.update(await AdminRepository(session).list_ids())
 
 
-def configure_admins_file(path: Path) -> None:
-    global BOT_ADMINS_FILE
-    BOT_ADMINS_FILE = path
+async def add_bot_admin(user_id: int) -> None:
+    from bot.repositories.admin_repository import AdminRepository
 
-
-def add_bot_admin(user_id: int) -> None:
     BOT_ADMIN_IDS.add(user_id)
-    save_bot_admins()
+    if is_database_configured():
+        async with get_session_factory()() as session:
+            if not await AdminRepository(session).exists(user_id):
+                await AdminRepository(session).add(user_id)
 
 
 def is_admin(member: discord.Member) -> bool:
@@ -264,6 +257,34 @@ class DraftSession:
         self.last_available_clans: list[str] | None = None
         self.last_picks_by_player: dict[int, list[str]] | None = None
 
+    async def persist_state(self) -> None:
+        if not is_database_configured():
+            return
+        state = {
+            "guild_id": self.players[0].guild.id,
+            "channel_id": self.channel.id,
+            "status_message_id": self.status_message.id if self.status_message else None,
+            "player_ids": [player.id for player in self.players],
+            "bo": self.bo,
+            "score": {str(player_id): score for player_id, score in self.score.items()},
+            "game_number": self.game_number,
+            "waiting_for_winner": self.waiting_for_winner,
+            "is_active": self.is_active,
+            "banned_clans": sorted(self.last_banned_clans or []),
+            "available_clans": self.last_available_clans or [],
+            "picks": {str(player_id): picks for player_id, picks in (self.last_picks_by_player or {}).items()},
+        }
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{DRAFT_STATE_PREFIX}{self.channel.id}", state)
+            await session.commit()
+
+    async def delete_persisted_state(self) -> None:
+        if not is_database_configured():
+            return
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).delete(f"{DRAFT_STATE_PREFIX}{self.channel.id}")
+            await session.commit()
+
     def start_next_game(self) -> None:
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
@@ -275,6 +296,7 @@ class DraftSession:
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
         active_drafts.pop(self.channel.id, None)
+        await self.delete_persisted_state()
         await self.update_status("Остановлен", "Драфт 2v2 остановлен админом.")
 
     async def restart_current_game_draft(self) -> None:
@@ -307,6 +329,8 @@ class DraftSession:
     async def run_next_game(self) -> None:
         if not self.is_active:
             return
+
+        await self.persist_state()
 
         self.status_message = None
         self.waiting_for_winner = False
@@ -411,6 +435,7 @@ class DraftSession:
                 picks_by_player=picks_by_player,
             )
             self.waiting_for_winner = True
+            await self.persist_state()
         except asyncio.CancelledError:
             return
 
@@ -441,6 +466,7 @@ class DraftSession:
             self.status_message = await self.channel.send(content)
         else:
             await self.status_message.edit(content=content, view=None)
+        await self.persist_state()
 
     def build_status_text(
         self,
@@ -612,6 +638,7 @@ class DraftSession:
         if self.score[winner.id] >= self.wins_to_take:
             await self.channel.send(f"Матч завершен. Победитель: {winner.mention}. Финальный счет: **{self.score_text()}**")
             active_drafts.pop(self.channel.id, None)
+            await self.delete_persisted_state()
             return
 
         self.game_number += 1
@@ -632,6 +659,48 @@ class DraftSession:
             available_clans=self.last_available_clans,
             picks_by_player=self.last_picks_by_player,
         )
+
+
+async def restore_active_drafts(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        states = await RuntimeStateRepository(session).list_prefix(DRAFT_STATE_PREFIX)
+    for _, state in states:
+        try:
+            channel = await bot.fetch_channel(int(state["channel_id"]))
+            guild = bot.get_guild(int(state["guild_id"]))
+            if guild is None or not isinstance(channel, discord.TextChannel):
+                continue
+            members = [guild.get_member(int(member_id)) or await guild.fetch_member(int(member_id)) for member_id in state["player_ids"]]
+            if len(members) != 2:
+                continue
+            session = DraftSession(bot, channel, members[0], members[1], state["bo"])
+            session.score = {int(player_id): int(score) for player_id, score in state["score"].items()}
+            session.game_number = int(state["game_number"])
+            session.waiting_for_winner = bool(state["waiting_for_winner"])
+            session.last_banned_clans = set(state.get("banned_clans", []))
+            session.last_available_clans = list(state.get("available_clans", []))
+            session.last_picks_by_player = {
+                int(player_id): list(picks) for player_id, picks in state.get("picks", {}).items()
+            }
+            status_message_id = state.get("status_message_id")
+            if status_message_id:
+                session.status_message = await channel.fetch_message(int(status_message_id))
+            active_drafts[channel.id] = session
+            if not session.waiting_for_winner:
+                session.start_next_game()
+            else:
+                await session.update_status(
+                    "Ожидание результата",
+                    "Бот восстановил драфт после перезапуска. Админ должен написать `win @player`.",
+                    draft_players=session.last_draft_players,
+                    banned_clans=session.last_banned_clans,
+                    available_clans=session.last_available_clans,
+                    picks_by_player=session.last_picks_by_player,
+                )
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore 2v2 draft")
 
 
 def validate_team_pair(picks: list[str], clan_rules: ClanRules = DEFAULT_CLAN_RULES) -> str | None:

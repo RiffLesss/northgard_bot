@@ -1,10 +1,9 @@
 import asyncio
-import json
 import logging
 import random
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
 
 import discord
 from discord import app_commands
@@ -14,6 +13,7 @@ from bot.config import Settings
 from bot.database.session import get_session_factory, is_database_configured
 from bot.models.enums import BestOf, DraftActionType, GameMode, PickType
 from bot.models.user import User
+from bot.repositories.runtime_state_repository import RuntimeStateRepository
 from bot.services.draft_service import is_admin
 from bot.services.team3_service import (
     TEAM3_DRAFT_STEPS,
@@ -37,7 +37,330 @@ casual_lobbies: dict[int, list[tuple[int, ...]]] = {}
 pending_ready_checks: set[int] = set()
 team3_panel_messages: dict[int, int] = {}
 active_team3_players: set[int] = set()
-TEAM3_PANEL_MESSAGES_FILE = Path("data/team3_panel_messages.json")
+TEAM3_STATE_KEY = "team3"
+TEAM3_DRAFT_PREFIX = "team3:draft:"
+TEAM3_RESULT_PREFIX = "team3:result:"
+TEAM3_DISPUTE_PREFIX = "team3:dispute:"
+TEAM3_READY_PREFIX = "team3:ready:"
+_team3_bot: commands.Bot | None = None
+_active_team3_drafts: dict[int, "Team3DraftView"] = {}
+_active_team3_results: dict[int, "ResultConfirmView"] = {}
+_active_team3_disputes: dict[int, "DisputeResolveView"] = {}
+_active_team3_ready_checks: dict[int, "ReadyCheckView"] = {}
+
+
+def _team3_state() -> dict:
+    return {
+        "panel_messages": {str(channel_id): message_id for channel_id, message_id in team3_panel_messages.items()},
+        "ranked_queue": {
+            str(discord_id): {
+                "user_id": entry.user_id,
+                "discord_id": entry.discord_id,
+                "nickname": entry.nickname,
+                "rating": entry.rating,
+                "wide": entry.wide,
+                "joined_at": entry.joined_at.isoformat(),
+            }
+            for discord_id, entry in ranked_queue.items()
+        },
+        "casual_lobbies": {str(channel_id): [list(group) for group in groups] for channel_id, groups in casual_lobbies.items()},
+        "active_players": sorted(active_team3_players),
+    }
+
+
+def schedule_team3_state_save() -> None:
+    if _team3_bot is not None and _team3_bot.is_ready():
+        _team3_bot.loop.create_task(_save_team3_state())
+
+
+async def _save_team3_state() -> None:
+    if not is_database_configured():
+        return
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await RuntimeStateRepository(session).put(TEAM3_STATE_KEY, _team3_state())
+        await session.commit()
+
+
+async def restore_team3_state() -> None:
+    if not is_database_configured():
+        return
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        state = await RuntimeStateRepository(session).get(TEAM3_STATE_KEY)
+    if not state:
+        return
+    team3_panel_messages.clear()
+    team3_panel_messages.update({int(k): int(v) for k, v in state.get("panel_messages", {}).items()})
+    ranked_queue.clear()
+    for raw in state.get("ranked_queue", {}).values():
+        ranked_queue[int(raw["discord_id"])] = QueueEntry(
+            user_id=int(raw["user_id"]),
+            discord_id=int(raw["discord_id"]),
+            nickname=str(raw["nickname"]),
+            rating=int(raw["rating"]),
+            wide=bool(raw["wide"]),
+            joined_at=datetime.fromisoformat(raw["joined_at"]),
+        )
+    casual_lobbies.clear()
+    casual_lobbies.update({int(k): [tuple(int(player) for player in group) for group in groups] for k, groups in state.get("casual_lobbies", {}).items()})
+    active_team3_players.clear()
+    active_team3_players.update(int(player) for player in state.get("active_players", []))
+
+
+def _draft_context_state(context: "Team3MatchContext") -> dict:
+    return {
+        "guild_id": context.team1_members[0].guild.id,
+        "match_id": context.match_id,
+        "team1_id": context.team1_id,
+        "team2_id": context.team2_id,
+        "team1_user_ids": context.team1_user_ids,
+        "team2_user_ids": context.team2_user_ids,
+        "team1_members": [member.id for member in context.team1_members],
+        "team2_members": [member.id for member in context.team2_members],
+        "game_mode": context.game_mode.value,
+        "best_of": context.best_of.value,
+        "game_number": context.game_number,
+        "team1_score": context.team1_score,
+        "team2_score": context.team2_score,
+        "clear_clans": context.clear_clans or [],
+        "eco_clans": context.eco_clans or [],
+        "text_channel_id": context.text_channel.id if context.text_channel else None,
+        "team1_role_id": context.team1_role.id if context.team1_role else None,
+        "team2_role_id": context.team2_role.id if context.team2_role else None,
+        "team1_voice_id": context.team1_channel.id if context.team1_channel else None,
+        "team2_voice_id": context.team2_channel.id if context.team2_channel else None,
+        "managed_text_channel": context.managed_text_channel,
+    }
+
+
+async def _delete_team3_draft_state(match_id: int) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        await RuntimeStateRepository(session).delete(f"{TEAM3_DRAFT_PREFIX}{match_id}")
+        await session.commit()
+
+
+async def _context_from_state(bot: commands.Bot, state: dict) -> tuple["Team3MatchContext", discord.TextChannel] | None:
+    guild = bot.get_guild(int(state["guild_id"]))
+    if guild is None:
+        return None
+    members_a = [await fetch_member(guild, int(member_id)) for member_id in state["team1_members"]]
+    members_b = [await fetch_member(guild, int(member_id)) for member_id in state["team2_members"]]
+    if any(member is None for member in [*members_a, *members_b]):
+        return None
+    channel = await bot.fetch_channel(int(state["channel_id"]))
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    context = Team3MatchContext(
+        match_id=int(state["match_id"]), team1_id=int(state["team1_id"]), team2_id=int(state["team2_id"]),
+        team1_members=[member for member in members_a if member is not None],
+        team2_members=[member for member in members_b if member is not None],
+        team1_user_ids=[int(value) for value in state["team1_user_ids"]],
+        team2_user_ids=[int(value) for value in state["team2_user_ids"]],
+        game_mode=GameMode(state["game_mode"]), best_of=BestOf(state["best_of"]),
+        game_number=int(state["game_number"]), team1_score=int(state["team1_score"]),
+        team2_score=int(state["team2_score"]), clear_clans=list(state["clear_clans"]),
+        eco_clans=list(state["eco_clans"]), text_channel=channel,
+        managed_text_channel=bool(state["managed_text_channel"]),
+    )
+    return context, channel
+
+
+async def restore_team3_drafts(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(TEAM3_DRAFT_PREFIX)
+    for _, state in rows:
+        try:
+            match_id = int(state["match_id"])
+            if match_id in _active_team3_drafts:
+                continue
+            restored = await _context_from_state(bot, state)
+            if restored is None:
+                continue
+            context, channel = restored
+            view = Team3DraftView(context, channel, lambda result_channel, match_context: start_result_confirmation(bot, result_channel, match_context))
+            view.step_index = int(state["step_index"])
+            view.bans = list(state["bans"])
+            view.picks = {side: list(values) for side, values in state["picks"].items()}
+            view.draft_results = list(state["draft_results"])
+            view.step_deadline = time.monotonic() + max(0, float(state["deadline"] - time.time()))
+            view.refresh_items()
+            message = await channel.fetch_message(int(state["message_id"]))
+            view.message = message
+            bot.add_view(view, message_id=message.id)
+            _active_team3_drafts[context.match_id] = view
+            view.start_timer()
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore 3v3 draft state")
+
+
+async def _delete_team3_result_state(match_id: int) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        await RuntimeStateRepository(session).delete(f"{TEAM3_RESULT_PREFIX}{match_id}")
+        await session.commit()
+
+
+async def restore_team3_results(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(TEAM3_RESULT_PREFIX)
+    for _, state in rows:
+        try:
+            restored = await _context_from_state(bot, state)
+            if restored is None:
+                continue
+            context, channel = restored
+            message = await channel.fetch_message(int(state["message_id"]))
+            view = ResultConfirmView(bot, context)
+            view.votes = {int(user_id): int(team_id) for user_id, team_id in state.get("votes", {}).items()}
+            view.timeout = max(0, float(state["deadline"] - time.time()))
+            view.deadline = float(state["deadline"])
+            bot.add_view(view, message_id=message.id)
+            view.message = message
+            _active_team3_results[context.match_id] = view
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore 3v3 result confirmation")
+
+
+async def _delete_team3_dispute_state(match_id: int) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        await RuntimeStateRepository(session).delete(f"{TEAM3_DISPUTE_PREFIX}{match_id}")
+        await session.commit()
+
+
+async def restore_team3_disputes(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(TEAM3_DISPUTE_PREFIX)
+    for _, state in rows:
+        try:
+            match_id = int(state["match_id"])
+            if match_id in _active_team3_disputes:
+                continue
+            restored = await _context_from_state(bot, state)
+            if restored is None:
+                continue
+            context, _ = restored
+            channel = bot.get_channel(int(state["dispute_channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                channel = await bot.fetch_channel(int(state["dispute_channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            message = await channel.fetch_message(int(state["message_id"]))
+            view = DisputeResolveView(bot, context)
+            view.votes = {int(user_id): int(team_id) for user_id, team_id in state["votes"].items()}
+            view.message = message
+            bot.add_view(view, message_id=message.id)
+            _active_team3_disputes[match_id] = view
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore 3v3 dispute")
+
+
+async def _delete_team3_ready_state(state_key: str) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        await RuntimeStateRepository(session).delete(state_key)
+        await session.commit()
+
+
+async def resume_team3_ready_match(bot: commands.Bot, state: dict) -> None:
+    guild = bot.get_guild(int(state["guild_id"]))
+    if guild is None:
+        return
+    source = await bot.fetch_channel(int(state["source_channel_id"]))
+    if not isinstance(source, discord.TextChannel):
+        return
+    team_a = [await fetch_member(guild, int(member_id)) for member_id in state["team_a_ids"]]
+    team_b = [await fetch_member(guild, int(member_id)) for member_id in state["team_b_ids"]]
+    if any(member is None for member in [*team_a, *team_b]):
+        return
+    members_a = [member for member in team_a if member is not None]
+    members_b = [member for member in team_b if member is not None]
+    if state["mode"] == GameMode.RANKED.value:
+        for member in [*members_a, *members_b]:
+            ranked_queue.pop(member.id, None)
+    active_team3_players.update(member.id for member in [*members_a, *members_b])
+    remove_from_all_searches({member.id for member in [*members_a, *members_b]})
+    await update_team3_panel(source, source.id)
+    context = await build_context(guild, members_a, members_b, GameMode(state["mode"]), BestOf(state["best_of"]))
+    ready_channel = await bot.fetch_channel(int(state["ready_channel_id"]))
+    if isinstance(ready_channel, discord.TextChannel):
+        context.text_channel = ready_channel
+        context.managed_text_channel = ready_channel.id != source.id
+        await rename_match_text_channel(ready_channel, context.match_id)
+    if state["mode"] == GameMode.RANKED.value:
+        try:
+            await create_ranked_resources(guild, context)
+            await move_match_members(context)
+        except discord.Forbidden:
+            pass
+    else:
+        try:
+            await create_casual_voice_channels(guild, context, source)
+            await move_match_members(context)
+        except discord.Forbidden:
+            pass
+    await send_team3_announcement(
+        guild,
+        source,
+        f"{state['mode'].capitalize()} 3v3 ready. Match #{context.match_id}\n"
+        f"Team A: {team_mentions(context.team1_members)}\n"
+        f"Team B: {team_mentions(context.team2_members)}\n"
+        f"Draft channel: {(context.text_channel or source).mention}",
+    )
+    await start_team3_draft(bot, context.text_channel or source, context)
+    if state.get("state_key"):
+        await _delete_team3_ready_state(state["state_key"])
+
+
+async def restore_team3_ready_checks(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(TEAM3_READY_PREFIX)
+    for state_key, state in rows:
+        try:
+            message_id = int(state["message_id"])
+            if message_id in _active_team3_ready_checks:
+                continue
+            guild = bot.get_guild(int(state["guild_id"]))
+            if guild is None:
+                continue
+            members = [await fetch_member(guild, int(member_id)) for member_id in state["member_ids"]]
+            if any(member is None for member in members):
+                continue
+            channel = await bot.fetch_channel(int(state["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            message = await channel.fetch_message(message_id)
+            workflow = {
+                key: state[key]
+                for key in ("guild_id", "source_channel_id", "ready_channel_id", "mode", "best_of", "team_a_ids", "team_b_ids")
+                if key in state
+            }
+            view = ReadyCheckView([member for member in members if member is not None], state["title"], state_key, workflow)
+            view.accepted_ids = {int(member_id) for member_id in state.get("accepted_ids", [])}
+            view.declined_id = state.get("declined_id")
+            view.timeout = max(0, float(state["deadline"] - time.time()))
+            bot.add_view(view, message_id=message.id)
+            view.message = message
+            _active_team3_ready_checks[message_id] = view
+            if view.accepted():
+                state["state_key"] = state_key
+                asyncio.create_task(resume_team3_ready_match(bot, state))
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore 3v3 ready-check")
 
 
 @dataclass
@@ -169,27 +492,15 @@ async def update_team3_panel(channel: discord.abc.Messageable, channel_id: int) 
         await message.edit(content=render_team3_panel(channel_id), view=Team3PanelView())
     except (AttributeError, discord.Forbidden, discord.NotFound):
         team3_panel_messages.pop(channel_id, None)
-        save_team3_panel_messages()
+    schedule_team3_state_save()
 
 
 def load_team3_panel_messages() -> None:
-    if not TEAM3_PANEL_MESSAGES_FILE.exists():
-        return
-    try:
-        with TEAM3_PANEL_MESSAGES_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        logger.exception("Failed to load 3v3 panel message registry")
-        return
-    team3_panel_messages.clear()
-    team3_panel_messages.update({int(channel_id): int(message_id) for channel_id, message_id in data.items()})
+    """Kept as a compatibility hook; state is restored asynchronously from the DB."""
 
 
 def save_team3_panel_messages() -> None:
-    TEAM3_PANEL_MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {str(channel_id): message_id for channel_id, message_id in team3_panel_messages.items()}
-    with TEAM3_PANEL_MESSAGES_FILE.open("w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
+    schedule_team3_state_save()
 
 
 async def fetch_saved_team3_panel(channel: discord.abc.Messageable, channel_id: int) -> discord.Message | None:
@@ -200,7 +511,7 @@ async def fetch_saved_team3_panel(channel: discord.abc.Messageable, channel_id: 
         return await channel.fetch_message(message_id)  # type: ignore[attr-defined]
     except (AttributeError, discord.Forbidden, discord.NotFound):
         team3_panel_messages.pop(channel_id, None)
-        save_team3_panel_messages()
+        schedule_team3_state_save()
         return None
 
 
@@ -218,6 +529,7 @@ def is_in_casual_lobby(channel_id: int, discord_id: int) -> bool:
 
 def clear_lobby(channel_id: int) -> None:
     casual_lobbies.pop(channel_id, None)
+    schedule_team3_state_save()
 
 
 def remove_users_from_lobby(channel_id: int, discord_ids: set[int]) -> None:
@@ -230,6 +542,7 @@ def remove_users_from_lobby(channel_id: int, discord_ids: set[int]) -> None:
         casual_lobbies[channel_id] = updated_groups
     else:
         casual_lobbies.pop(channel_id, None)
+    schedule_team3_state_save()
 
 
 def remove_from_all_searches(discord_ids: set[int]) -> None:
@@ -237,6 +550,7 @@ def remove_from_all_searches(discord_ids: set[int]) -> None:
         ranked_queue.pop(discord_id, None)
     for channel_id in list(casual_lobbies):
         remove_users_from_lobby(channel_id, discord_ids)
+    schedule_team3_state_save()
 
 
 def match_discord_ids(context: Team3MatchContext) -> set[int]:
@@ -456,6 +770,25 @@ class Team3DraftView(LoggedView):
         self.finished = False
         self.refresh_items()
 
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None:
+            return
+        state = _draft_context_state(self.context)
+        state.update(
+            {
+                "channel_id": self.channel.id,
+                "message_id": self.message.id,
+                "step_index": self.step_index,
+                "bans": self.bans,
+                "picks": self.picks,
+                "draft_results": self.draft_results,
+                "deadline": time.time() + self.remaining_seconds(),
+            }
+        )
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{TEAM3_DRAFT_PREFIX}{self.context.match_id}", state)
+            await session.commit()
+
     def current_step(self) -> Team3DraftStep | None:
         if self.step_index >= len(TEAM3_DRAFT_STEPS):
             return None
@@ -566,6 +899,8 @@ class Team3DraftView(LoggedView):
         if self.current_step() is None:
             self.finished = True
             self.cancel_timer()
+            await _delete_team3_draft_state(self.context.match_id)
+            _active_team3_drafts.pop(self.context.match_id, None)
             if interaction is not None:
                 await edit_interaction_message(interaction, self.render(), None)
             elif self.message is not None:
@@ -575,6 +910,7 @@ class Team3DraftView(LoggedView):
             return
 
         self.step_deadline = time.monotonic() + DRAFT_STEP_SECONDS
+        await self.persist()
         self.start_timer()
         if interaction is not None:
             await edit_interaction_message(interaction, self.render(), self)
@@ -651,7 +987,11 @@ class Team3DraftView(LoggedView):
 class Team3ClanSelect(discord.ui.Select):
     def __init__(self, step: Team3DraftStep, clans: list[str]):
         options = [discord.SelectOption(label=clan, value=clan) for clan in clans[:25]]
-        super().__init__(placeholder=f"Team {step.side}: {step.action_type.value} {step.pick_type.value}", options=options)
+        super().__init__(
+            placeholder=f"Team {step.side}: {step.action_type.value} {step.pick_type.value}",
+            custom_id=f"team3_draft:{step.side}:{step.action_type.value}:{step.pick_type.value}",
+            options=options,
+        )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view = self.view
@@ -667,6 +1007,24 @@ class ResultConfirmView(LoggedView):
         self.context = context
         self.votes: dict[int, int] = {}
         self.finished = False
+        self.message: discord.Message | None = None
+        self.deadline = time.time() + self.timeout
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None:
+            return
+        state = _draft_context_state(self.context)
+        state.update(
+            {
+                "channel_id": self.message.channel.id,
+                "message_id": self.message.id,
+                "votes": {str(user_id): team_id for user_id, team_id in self.votes.items()},
+                "deadline": self.deadline,
+            }
+        )
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{TEAM3_RESULT_PREFIX}{self.context.match_id}", state)
+            await session.commit()
 
     def team_for_user(self, discord_id: int) -> str | None:
         if discord_id in {member.id for member in self.context.team1_members}:
@@ -706,6 +1064,7 @@ class ResultConfirmView(LoggedView):
             await interaction.response.send_message("You are not a participant in this match.", ephemeral=True)
             return
         self.votes[interaction.user.id] = winner_team_id
+        await self.persist()
         accepted = self.accepted_winner()
         if accepted is None:
             if self.has_conflict():
@@ -715,6 +1074,8 @@ class ResultConfirmView(LoggedView):
                     ephemeral=True,
                 )
                 await send_result_dispute(self.bot, self.context, self.votes)
+                await _delete_team3_result_state(self.context.match_id)
+                _active_team3_results.pop(self.context.match_id, None)
                 self.stop()
                 return
             await interaction.response.send_message("Vote accepted. Waiting for confirmation from 2 players on each team.", ephemeral=True)
@@ -723,30 +1084,56 @@ class ResultConfirmView(LoggedView):
         self.finished = True
         await interaction.response.defer(ephemeral=True)
         await finish_team3_match(self.bot, interaction, self.context, accepted)
+        await _delete_team3_result_state(self.context.match_id)
+        _active_team3_results.pop(self.context.match_id, None)
         self.stop()
 
     async def on_timeout(self) -> None:
         if self.finished:
             return
         self.finished = True
+        await _delete_team3_result_state(self.context.match_id)
+        _active_team3_results.pop(self.context.match_id, None)
         await cancel_team3_match(self.context, "Result confirmation timed out. The match has been cancelled.")
 
-    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success, custom_id="team3_result:team_a")
     async def team_a_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team1_id)
 
-    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success, custom_id="team3_result:team_b")
     async def team_b_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team2_id)
 
 
 class ReadyCheckView(LoggedView):
-    def __init__(self, members: list[discord.Member], title: str):
+    def __init__(self, members: list[discord.Member], title: str, state_key: str | None = None, workflow: dict | None = None):
         super().__init__(timeout=60)
         self.members = members
         self.title = title
+        self.state_key = state_key
+        self.workflow = workflow or {}
         self.accepted_ids: set[int] = set()
         self.declined_id: int | None = None
+        self.message: discord.Message | None = None
+        self.deadline = time.time() + 60
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None or self.state_key is None:
+            return
+        state = {
+            "guild_id": self.members[0].guild.id,
+            "channel_id": self.message.channel.id,
+            "message_id": self.message.id,
+            "member_ids": [member.id for member in self.members],
+            "title": self.title,
+            "accepted_ids": sorted(self.accepted_ids),
+            "declined_id": self.declined_id,
+            "deadline": self.deadline,
+            **self.workflow,
+        }
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(self.state_key, state)
+            await session.commit()
 
     async def update_message(self, interaction: discord.Interaction) -> None:
         await interaction.response.edit_message(content=self.render(), view=self)
@@ -761,41 +1148,66 @@ class ReadyCheckView(LoggedView):
             f"Confirmation time: 60 seconds."
         )
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="team3_ready:accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         allowed_ids = {member.id for member in self.members}
         if interaction.user.id not in allowed_ids:
             await interaction.response.send_message("You are not a participant in this ready-check.", ephemeral=True)
             return
         self.accepted_ids.add(interaction.user.id)
+        await self.persist()
         if len(self.accepted_ids) == len(self.members):
             for item in self.children:
                 item.disabled = True
             await self.update_message(interaction)
+            if self.state_key is not None:
+                await _delete_team3_ready_state(self.state_key)
+            _active_team3_ready_checks.pop(self.message.id if self.message else 0, None)
             self.stop()
             return
         await self.update_message(interaction)
 
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="team3_ready:decline")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         allowed_ids = {member.id for member in self.members}
         if interaction.user.id not in allowed_ids:
             await interaction.response.send_message("You are not a participant in this ready-check.", ephemeral=True)
             return
         self.declined_id = interaction.user.id
+        await self.persist()
         for item in self.children:
             item.disabled = True
         await self.update_message(interaction)
+        if self.state_key is not None:
+            await _delete_team3_ready_state(self.state_key)
+        _active_team3_ready_checks.pop(self.message.id if self.message else 0, None)
         self.stop()
 
     def accepted(self) -> bool:
         return self.declined_id is None and len(self.accepted_ids) == len(self.members)
 
+    async def on_timeout(self) -> None:
+        if self.state_key is not None:
+            await _delete_team3_ready_state(self.state_key)
+        _active_team3_ready_checks.pop(self.message.id if self.message else 0, None)
 
-async def run_ready_check(channel: discord.abc.Messageable, members: list[discord.Member], title: str) -> ReadyCheckView:
-    view = ReadyCheckView(members, title)
+
+async def run_ready_check(
+    channel: discord.abc.Messageable,
+    members: list[discord.Member],
+    title: str,
+    workflow: dict | None = None,
+) -> ReadyCheckView:
+    state_key = f"{TEAM3_READY_PREFIX}{channel.id}:{int(time.time() * 1000)}"
+    view = ReadyCheckView(members, title, state_key, workflow)
     message = await channel.send(view.render(), view=view)
+    view.message = message
+    _active_team3_ready_checks[message.id] = view
+    await view.persist()
     await view.wait()
+    if view.state_key is not None:
+        await _delete_team3_ready_state(view.state_key)
+    _active_team3_ready_checks.pop(message.id, None)
     for item in view.children:
         item.disabled = True
     try:
@@ -877,6 +1289,24 @@ class DisputeResolveView(LoggedView):
         self.bot = bot
         self.context = context
         self.resolved = False
+        self.message: discord.Message | None = None
+        self.votes: dict[int, int] = {}
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None:
+            return
+        state = _draft_context_state(self.context)
+        state.update(
+            {
+                "channel_id": self.message.channel.id,
+                "dispute_channel_id": self.message.channel.id,
+                "message_id": self.message.id,
+                "votes": {str(user_id): team_id for user_id, team_id in self.votes.items()},
+            }
+        )
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{TEAM3_DISPUTE_PREFIX}{self.context.match_id}", state)
+            await session.commit()
 
     async def resolve(self, interaction: discord.Interaction, winner_team_id: int) -> None:
         if self.resolved:
@@ -891,12 +1321,14 @@ class DisputeResolveView(LoggedView):
             item.disabled = True
         await interaction.message.edit(view=self)
         await finish_team3_match(self.bot, interaction, self.context, winner_team_id)
+        await _delete_team3_dispute_state(self.context.match_id)
+        _active_team3_disputes.pop(self.context.match_id, None)
 
-    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success, custom_id="team3_dispute:team_a")
     async def team_a_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.resolve(interaction, self.context.team1_id)
 
-    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success, custom_id="team3_dispute:team_b")
     async def team_b_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.resolve(interaction, self.context.team2_id)
 
@@ -921,7 +1353,9 @@ async def send_result_dispute(bot: commands.Bot, context: Team3MatchContext, vot
             return f"{member.mention}: Team B"
         return f"{member.mention}: no vote"
 
-    await channel.send(
+    view = DisputeResolveView(bot, context)
+    view.votes = dict(votes)
+    message = await channel.send(
         "@here\n"
         f"Disputed result for 3v3 match #{context.match_id}.\n"
         f"Game {context.game_number}. Series score: {series_score(context)}.\n"
@@ -932,18 +1366,25 @@ async def send_result_dispute(bot: commands.Bot, context: Team3MatchContext, vot
         + "\n\n**Team B votes:**\n"
         + "\n".join(vote_label(member) for member in context.team2_members)
         + "\n\nChoose the winner:",
-        view=DisputeResolveView(bot, context),
+        view=view,
     )
+    view.message = message
+    _active_team3_disputes[context.match_id] = view
+    await view.persist()
 
 
 async def start_result_confirmation(bot: commands.Bot, channel: discord.abc.Messageable, context: Team3MatchContext) -> None:
-    await channel.send(
+    view = ResultConfirmView(bot, context)
+    message = await channel.send(
         f"Match #{context.match_id}, Game {context.game_number} has started.\n"
         f"Series score: **{series_score(context)}**.\n"
         f"After the game, confirm the winner. At least 2 votes from each team are required.\n"
         f"Time limit: {'2 hours' if context.best_of == BestOf.BO1 else '24 hours'}.",
-        view=ResultConfirmView(bot, context),
+        view=view,
     )
+    view.message = message
+    _active_team3_results[context.match_id] = view
+    await view.persist()
 
 
 async def start_team3_draft(bot: commands.Bot, channel: discord.abc.Messageable, context: Team3MatchContext) -> None:
@@ -953,6 +1394,8 @@ async def start_team3_draft(bot: commands.Bot, channel: discord.abc.Messageable,
     view = Team3DraftView(context, channel, on_finish)
     message = await channel.send(view.render(), view=view)
     view.message = message
+    _active_team3_drafts[context.match_id] = view
+    await view.persist()
     view.start_timer()
 
 
@@ -1133,7 +1576,20 @@ async def maybe_start_ranked_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(interaction.guild, interaction.channel, "The bot cannot create a ready-check channel. Ready-check will happen here.")
 
     pending_ready_checks.add(interaction.channel.id)
-    ready_check = await run_ready_check(ready_channel, members, "Ranked 3v3")
+    ready_check = await run_ready_check(
+        ready_channel,
+        members,
+        "Ranked 3v3",
+        {
+            "guild_id": interaction.guild.id,
+            "source_channel_id": interaction.channel.id,
+            "ready_channel_id": ready_channel.id,
+            "mode": GameMode.RANKED.value,
+            "best_of": BestOf.BO1.value,
+            "team_a_ids": [member.id for member in team1_members if member is not None],
+            "team_b_ids": [member.id for member in team2_members if member is not None],
+        },
+    )
     pending_ready_checks.discard(interaction.channel.id)
     if not ready_check.accepted():
         ready_ids = {member.id for member in members}
@@ -1249,7 +1705,20 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
         await send_team3_announcement(interaction.guild, interaction.channel, "The bot cannot create a ready-check channel. Ready-check will happen here.")
 
     pending_ready_checks.add(interaction.channel_id)
-    ready_check = await run_ready_check(ready_channel, members, "Casual 3v3")
+    ready_check = await run_ready_check(
+        ready_channel,
+        members,
+        "Casual 3v3",
+        {
+            "guild_id": interaction.guild.id,
+            "source_channel_id": interaction.channel.id,
+            "ready_channel_id": ready_channel.id,
+            "mode": GameMode.CASUAL.value,
+            "best_of": BestOf.BO1.value,
+            "team_a_ids": [member.id for member in team1_members if member is not None],
+            "team_b_ids": [member.id for member in team2_members if member is not None],
+        },
+    )
     pending_ready_checks.discard(interaction.channel_id)
     if not ready_check.accepted():
         ready_ids = {member.id for member in members}
@@ -1304,8 +1773,19 @@ async def maybe_start_casual_match(interaction: discord.Interaction) -> None:
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
+    global _team3_bot
+    _team3_bot = bot
     load_team3_panel_messages()
     bot.add_view(Team3PanelView())
+
+    async def restore_persistent_team3_state() -> None:
+        await restore_team3_state()
+        await restore_team3_drafts(bot)
+        await restore_team3_results(bot)
+        await restore_team3_disputes(bot)
+        await restore_team3_ready_checks(bot)
+
+    bot.add_listener(restore_persistent_team3_state, "on_ready")
 
     @bot.tree.command(name="team3_panel", description="Create the 3v3 matchmaking panel")
     @app_commands.default_permissions(manage_guild=True)

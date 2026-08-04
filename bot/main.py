@@ -6,7 +6,7 @@ from discord.ext import commands
 from bot.cogs import admin, bear, blacklist, draft, matchmaking, registration, scrim, team3
 from bot.config import Settings, load_settings
 from bot.database.session import init_database
-from bot.services.draft_service import configure_admins_file, load_bot_admins
+from bot.services.draft_service import load_bot_admins_from_db
 
 
 logging.basicConfig(
@@ -31,6 +31,7 @@ def create_bot(settings: Settings) -> commands.Bot:
 
     @bot.event
     async def on_ready() -> None:
+        await load_bot_admins_from_db()
         if settings.discord_guild_id:
             guild = discord.Object(id=settings.discord_guild_id)
             bot.tree.copy_global_to(guild=guild)
@@ -48,8 +49,6 @@ def create_bot(settings: Settings) -> commands.Bot:
 def main() -> None:
     settings = load_settings()
     init_database(settings)
-    configure_admins_file(settings.bot_admins_file)
-    load_bot_admins()
     bot = create_bot(settings)
     bot.run(settings.discord_bot_token)
 

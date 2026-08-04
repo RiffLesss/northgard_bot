@@ -8,6 +8,7 @@ When adding or changing project documentation, update this index in the same cha
 - [3v3 Modes](docs/team3_usage.md) - how the 3v3 panel, casual queue, ranked queue, ready checks, draft flow, result confirmation, disputes, and cleanup work.
 - [NSL Scrims](docs/nsl_scrims.md) - how tournament team setup, scrim invites, bo5 draft order, fearless eco picks, magic cards, and result confirmation work.
 - [NSL Tournament](docs/nsl_tournament.md) - how NSL schedule generation, scheduled match starts, and Elo updates work.
+- [Persistent Workflows](docs/runtime_persistence.md) - how interactive Discord state is stored and restored after restart.
 
 ## Project Entry Points
 

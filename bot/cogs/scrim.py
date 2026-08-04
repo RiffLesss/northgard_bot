@@ -15,6 +15,7 @@ from bot.models.enums import DraftActionType, PickType
 from bot.models.nsl import NslTeam
 from bot.repositories.clan_repository import ClanRepository
 from bot.repositories.nsl_repository import NslTeamRepository
+from bot.repositories.runtime_state_repository import RuntimeStateRepository
 from bot.repositories.user_repository import UserRepository
 from bot.services.draft_service import is_admin
 from bot.services.nsl_service import generate_nsl_schedule, nsl_rating_update, next_monday
@@ -72,6 +73,54 @@ class ScrimContext:
             self.team_b_previous_eco_picks = set()
 
 
+def scrim_state(context: ScrimContext) -> dict:
+    return {
+        "guild_id": context.guild.id,
+        "channel_id": context.channel.id,
+        "team_a_role_id": context.team_a_role.id,
+        "team_b_role_id": context.team_b_role.id,
+        "team_a_nsl_id": context.team_a_nsl_id,
+        "team_b_nsl_id": context.team_b_nsl_id,
+        "team_a_member_ids": [member.id for member in context.team_a_members],
+        "team_b_member_ids": [member.id for member in context.team_b_members],
+        "clear_clans": context.clear_clans,
+        "eco_clans": context.eco_clans,
+        "scheduled_match_id": context.scheduled_match_id,
+        "game_number": context.game_number,
+        "team_a_score": context.team_a_score,
+        "team_b_score": context.team_b_score,
+        "team_a_previous_eco_picks": sorted(context.team_a_previous_eco_picks or set()),
+        "team_b_previous_eco_picks": sorted(context.team_b_previous_eco_picks or set()),
+        "team_a_magic_available": context.team_a_magic_available,
+        "team_b_magic_available": context.team_b_magic_available,
+    }
+
+
+async def restore_scrim_context(bot: commands.Bot, state: dict) -> ScrimContext | None:
+    guild = bot.get_guild(int(state["guild_id"]))
+    if guild is None:
+        return None
+    channel = await bot.fetch_channel(int(state["channel_id"]))
+    role_a = guild.get_role(int(state["team_a_role_id"]))
+    role_b = guild.get_role(int(state["team_b_role_id"]))
+    if not isinstance(channel, discord.TextChannel) or role_a is None or role_b is None:
+        return None
+    members_a = [await guild.fetch_member(int(member_id)) for member_id in state["team_a_member_ids"]]
+    members_b = [await guild.fetch_member(int(member_id)) for member_id in state["team_b_member_ids"]]
+    return ScrimContext(
+        guild=guild, channel=channel, team_a_role=role_a, team_b_role=role_b,
+        team_a_nsl_id=int(state["team_a_nsl_id"]), team_b_nsl_id=int(state["team_b_nsl_id"]),
+        team_a_members=members_a, team_b_members=members_b,
+        clear_clans=list(state["clear_clans"]), eco_clans=list(state["eco_clans"]),
+        scheduled_match_id=state.get("scheduled_match_id"), game_number=int(state["game_number"]),
+        team_a_score=int(state["team_a_score"]), team_b_score=int(state["team_b_score"]),
+        team_a_previous_eco_picks=set(state.get("team_a_previous_eco_picks", [])),
+        team_b_previous_eco_picks=set(state.get("team_b_previous_eco_picks", [])),
+        team_a_magic_available=bool(state["team_a_magic_available"]),
+        team_b_magic_available=bool(state["team_b_magic_available"]),
+    )
+
+
 SCRIM_DRAFT_STEPS = [
     ScrimDraftStep("A", DraftActionType.BAN, PickType.CLEAR),
     ScrimDraftStep("B", DraftActionType.BAN, PickType.CLEAR),
@@ -90,6 +139,11 @@ SCRIM_DRAFT_STEPS = [
 active_scrim_channels: set[int] = set()
 active_nsl_match_ids: set[int] = set()
 nsl_leaderboard_message_id: int | None = None
+NSL_STATE_PREFIX = "nsl:"
+NSL_INVITE_PREFIX = "nsl:invite:"
+NSL_READY_PREFIX = "nsl:ready:"
+_active_nsl_drafts: dict[int, "ScrimDraftView"] = {}
+_active_nsl_results: dict[int, "ScrimResultView"] = {}
 
 
 class LoggedView(discord.ui.View):
@@ -231,18 +285,32 @@ async def role_for_nsl_team(guild: discord.Guild, team: NslTeam) -> discord.Role
 
 
 class ScrimAcceptView(LoggedView):
-    def __init__(self, challenger_role: discord.Role, target_role: discord.Role):
+    def __init__(self, challenger_role: discord.Role, target_role: discord.Role, state_key: str | None = None, workflow: dict | None = None):
         super().__init__(timeout=SCRIM_ACCEPT_SECONDS)
         self.challenger_role = challenger_role
         self.target_role = target_role
         self.accepted = False
+        self.state_key = state_key
+        self.workflow = workflow or {}
+        self.message: discord.Message | None = None
 
-    @discord.ui.button(label="Accept scrim", style=discord.ButtonStyle.success)
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None or self.state_key is None:
+            return
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(self.state_key, {
+                **self.workflow, "message_id": self.message.id, "channel_id": self.message.channel.id,
+                "accepted": self.accepted,
+            })
+            await session.commit()
+
+    @discord.ui.button(label="Accept scrim", style=discord.ButtonStyle.success, custom_id="nsl_invite:accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not isinstance(interaction.user, discord.Member) or self.target_role not in interaction.user.roles:
             await interaction.response.send_message("Only the challenged team can accept this scrim.", ephemeral=True)
             return
         self.accepted = True
+        await self.persist()
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
@@ -257,12 +325,25 @@ class ScrimAcceptView(LoggedView):
 
 
 class NslMatchReadyView(LoggedView):
-    def __init__(self, team_a_role: discord.Role, team_b_role: discord.Role):
+    def __init__(self, team_a_role: discord.Role, team_b_role: discord.Role, state_key: str | None = None, workflow: dict | None = None):
         super().__init__(timeout=SCRIM_ACCEPT_SECONDS)
         self.team_a_role = team_a_role
         self.team_b_role = team_b_role
         self.team_a_ready = False
         self.team_b_ready = False
+        self.state_key = state_key
+        self.workflow = workflow or {}
+        self.message: discord.Message | None = None
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None or self.state_key is None:
+            return
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(self.state_key, {
+                **self.workflow, "message_id": self.message.id, "channel_id": self.message.channel.id,
+                "team_a_ready": self.team_a_ready, "team_b_ready": self.team_b_ready,
+            })
+            await session.commit()
 
     def render(self) -> str:
         return (
@@ -276,7 +357,7 @@ class NslMatchReadyView(LoggedView):
     def accepted(self) -> bool:
         return self.team_a_ready and self.team_b_ready
 
-    @discord.ui.button(label="Ready", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Ready", style=discord.ButtonStyle.success, custom_id="nsl_ready:accept")
     async def ready(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This button is only available on a server.", ephemeral=True)
@@ -288,6 +369,7 @@ class NslMatchReadyView(LoggedView):
         else:
             await interaction.response.send_message("Only match participants can accept this ready-check.", ephemeral=True)
             return
+        await self.persist()
         if self.accepted():
             for item in self.children:
                 item.disabled = True
@@ -302,6 +384,7 @@ class ScrimClanSelect(discord.ui.Select):
         select_options = [discord.SelectOption(label=clan, value=clan) for clan in options[:25]]
         super().__init__(
             placeholder=f"{step.side}: {step.action_type.value} {step.pick_type.value}",
+            custom_id=f"nsl_draft:{step.side}:{step.action_type.value}:{step.pick_type.value}",
             options=select_options,
         )
 
@@ -314,7 +397,7 @@ class ScrimClanSelect(discord.ui.Select):
 class ScrimMagicSelect(discord.ui.Select):
     def __init__(self, options: list[str]):
         select_options = [discord.SelectOption(label=clan, value=clan) for clan in options[:25]]
-        super().__init__(placeholder="Use magic card to revert opponent ban", options=select_options)
+        super().__init__(placeholder="Use magic card to revert opponent ban", custom_id="nsl_draft:magic", options=select_options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view = self.view
@@ -337,6 +420,29 @@ class ScrimDraftView(LoggedView):
         self.finished = False
         self.lock = asyncio.Lock()
         self.refresh_items()
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None:
+            return
+        state = scrim_state(self.context)
+        state.update({
+            "message_id": self.message.id,
+            "step_index": self.step_index,
+            "bans": [{"side": ban.side, "clan": ban.clan, "fearless": ban.fearless, "reverted": ban.reverted} for ban in self.bans],
+            "picks": self.picks,
+            "draft_results": self.draft_results,
+            "deadline": time.time() + self.remaining_seconds(),
+        })
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{NSL_STATE_PREFIX}draft:{self.context.channel.id}", state)
+            await session.commit()
+
+    async def delete_state(self) -> None:
+        if not is_database_configured():
+            return
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).delete(f"{NSL_STATE_PREFIX}draft:{self.context.channel.id}")
+            await session.commit()
 
     def current_step(self) -> ScrimDraftStep | None:
         if self.step_index >= len(SCRIM_DRAFT_STEPS):
@@ -540,9 +646,12 @@ class ScrimDraftView(LoggedView):
             self.finished = True
             self.cancel_timer()
             await self.finish_draft(interaction)
+            await self.delete_state()
+            _active_nsl_drafts.pop(self.context.channel.id, None)
             self.stop()
             return
         self.step_deadline = time.monotonic() + SCRIM_DRAFT_STEP_SECONDS
+        await self.persist()
         self.start_timer()
         if interaction is not None:
             await interaction.edit_original_response(content=self.render(), view=self)
@@ -559,13 +668,17 @@ class ScrimDraftView(LoggedView):
             await interaction.edit_original_response(content=self.render(), view=None)
         elif self.message is not None:
             await self.message.edit(content=self.render(), view=None)
-        await self.context.channel.send(
+        result_view = ScrimResultView(self.bot, self.context)
+        result_message = await self.context.channel.send(
             f"Game {self.context.game_number} draft finished.\n"
             f"Side A picks: {self.format_clans(self.picks['A'])}\n"
             f"Side B picks: {self.format_clans(self.picks['B'])}\n\n"
             "After the game, confirm the winner:",
-            view=ScrimResultView(self.bot, self.context),
+            view=result_view,
         )
+        result_view.message = result_message
+        _active_nsl_results[self.context.channel.id] = result_view
+        await result_view.persist()
 
     def start_timer(self) -> None:
         self.cancel_timer()
@@ -604,6 +717,28 @@ class ScrimResultView(LoggedView):
         self.context = context
         self.votes: dict[int, int] = {}
         self.finished = False
+        self.message: discord.Message | None = None
+        self.deadline = time.time() + 86400
+
+    async def persist(self) -> None:
+        if not is_database_configured() or self.message is None:
+            return
+        state = scrim_state(self.context)
+        state.update({
+            "message_id": self.message.id,
+            "votes": {str(user_id): role_id for user_id, role_id in self.votes.items()},
+            "deadline": self.deadline,
+        })
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).put(f"{NSL_STATE_PREFIX}result:{self.context.channel.id}", state)
+            await session.commit()
+
+    async def delete_state(self) -> None:
+        if not is_database_configured():
+            return
+        async with get_session_factory()() as session:
+            await RuntimeStateRepository(session).delete(f"{NSL_STATE_PREFIX}result:{self.context.channel.id}")
+            await session.commit()
 
     def team_for_user(self, user_id: int) -> str | None:
         if user_id in {member.id for member in self.context.team_a_members}:
@@ -628,6 +763,7 @@ class ScrimResultView(LoggedView):
             await interaction.response.send_message("Only scrim participants can confirm the result.", ephemeral=True)
             return
         self.votes[interaction.user.id] = winner_role.id
+        await self.persist()
         winner_id = self.accepted_winner()
         if winner_id is None:
             await interaction.response.send_message("Vote accepted. Waiting for confirmation from the other team.", ephemeral=True)
@@ -642,6 +778,8 @@ class ScrimResultView(LoggedView):
             self.context.team_b_score += 1
         if max(self.context.team_a_score, self.context.team_b_score) >= wins_needed():
             active_scrim_channels.discard(self.context.channel.id)
+            await self.delete_state()
+            _active_nsl_results.pop(self.context.channel.id, None)
             await finish_scheduled_nsl_match_if_needed(self.bot, self.context)
             await self.context.channel.send(
                 f"🏁 Scrim finished.\n"
@@ -656,13 +794,15 @@ class ScrimResultView(LoggedView):
             f"Starting Game {self.context.game_number} draft."
         )
         await start_scrim_draft(self.bot, self.context)
+        await self.delete_state()
+        _active_nsl_results.pop(self.context.channel.id, None)
         self.stop()
 
-    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team A won", style=discord.ButtonStyle.success, custom_id="nsl_result:team_a")
     async def team_a_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team_a_role)
 
-    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Team B won", style=discord.ButtonStyle.success, custom_id="nsl_result:team_b")
     async def team_b_won(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.vote(interaction, self.context.team_b_role)
 
@@ -671,7 +811,127 @@ async def start_scrim_draft(bot: commands.Bot, context: ScrimContext) -> None:
     view = ScrimDraftView(bot, context)
     message = await context.channel.send(view.render(), view=view)
     view.message = message
+    _active_nsl_drafts[context.channel.id] = view
+    await view.persist()
     view.start_timer()
+
+
+async def restore_active_nsl_drafts(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(f"{NSL_STATE_PREFIX}draft:")
+    for _, state in rows:
+        try:
+            context = await restore_scrim_context(bot, state)
+            if context is None or context.channel.id in _active_nsl_drafts:
+                continue
+            message = await context.channel.fetch_message(int(state["message_id"]))
+            view = ScrimDraftView(bot, context)
+            view.step_index = int(state["step_index"])
+            view.bans = [ScrimBan(item["side"], item["clan"], bool(item["fearless"]), bool(item["reverted"])) for item in state["bans"]]
+            view.picks = {side: list(values) for side, values in state["picks"].items()}
+            view.draft_results = list(state["draft_results"])
+            view.step_deadline = time.monotonic() + max(0, float(state["deadline"] - time.time()))
+            view.refresh_items()
+            view.message = message
+            bot.add_view(view, message_id=message.id)
+            _active_nsl_drafts[context.channel.id] = view
+            view.start_timer()
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore NSL scrim draft")
+
+
+async def restore_active_nsl_results(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(f"{NSL_STATE_PREFIX}result:")
+    for _, state in rows:
+        try:
+            context = await restore_scrim_context(bot, state)
+            if context is None or context.channel.id in _active_nsl_results:
+                continue
+            message = await context.channel.fetch_message(int(state["message_id"]))
+            view = ScrimResultView(bot, context)
+            view.votes = {int(user_id): int(role_id) for user_id, role_id in state.get("votes", {}).items()}
+            view.deadline = float(state["deadline"])
+            view.timeout = max(0, view.deadline - time.time())
+            view.message = message
+            bot.add_view(view, message_id=message.id)
+            _active_nsl_results[context.channel.id] = view
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore NSL scrim result")
+
+
+async def _delete_nsl_state(key: str) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        await RuntimeStateRepository(session).delete(key)
+        await session.commit()
+
+
+async def stop_scrim_in_channel(channel: discord.TextChannel) -> bool:
+    stopped = False
+    draft = _active_nsl_drafts.pop(channel.id, None)
+    if draft is not None:
+        draft.finished = True
+        draft.cancel_timer()
+        await draft.delete_state()
+        stopped = True
+    result = _active_nsl_results.pop(channel.id, None)
+    if result is not None:
+        result.finished = True
+        await result.delete_state()
+        stopped = True
+    active_scrim_channels.discard(channel.id)
+    await _delete_nsl_state(f"{NSL_INVITE_PREFIX}{channel.id}")
+    return stopped
+
+
+async def restore_nsl_entry_views(bot: commands.Bot) -> None:
+    if not is_database_configured():
+        return
+    async with get_session_factory()() as session:
+        rows = await RuntimeStateRepository(session).list_prefix(NSL_INVITE_PREFIX)
+        rows += await RuntimeStateRepository(session).list_prefix(NSL_READY_PREFIX)
+    for state_key, state in rows:
+        try:
+            guild = bot.get_guild(int(state["guild_id"]))
+            if guild is None:
+                continue
+            channel = await bot.fetch_channel(int(state["channel_id"]))
+            role_a = guild.get_role(int(state["team_a_role_id"]))
+            role_b = guild.get_role(int(state["team_b_role_id"]))
+            if not isinstance(channel, discord.TextChannel) or role_a is None or role_b is None:
+                continue
+            message = await channel.fetch_message(int(state["message_id"]))
+            if state_key.startswith(NSL_INVITE_PREFIX):
+                view = ScrimAcceptView(role_a, role_b, state_key, state)
+                view.accepted = bool(state.get("accepted"))
+                bot.add_view(view, message_id=message.id)
+                view.message = message
+                if view.accepted:
+                    context = await restore_scrim_context(bot, state)
+                    if context is not None:
+                        context.clear_clans, context.eco_clans = await load_clan_pools()
+                        await _delete_nsl_state(state_key)
+                        await start_scrim_draft(bot, context)
+            else:
+                view = NslMatchReadyView(role_a, role_b, state_key, state)
+                view.team_a_ready = bool(state.get("team_a_ready"))
+                view.team_b_ready = bool(state.get("team_b_ready"))
+                bot.add_view(view, message_id=message.id)
+                view.message = message
+                if view.accepted():
+                    context = await restore_scrim_context(bot, state)
+                    if context is not None:
+                        context.clear_clans, context.eco_clans = await load_clan_pools()
+                        await _delete_nsl_state(state_key)
+                        await start_scrim_draft(bot, context)
+        except (KeyError, TypeError, ValueError, discord.DiscordException):
+            logger.exception("Failed to restore NSL entry workflow")
 
 
 async def finish_scheduled_nsl_match_if_needed(bot: commands.Bot, context: ScrimContext) -> None:
@@ -883,6 +1143,27 @@ async def send_long_response(interaction: discord.Interaction, content: str) -> 
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
+    async def restore_persistent_nsl_state() -> None:
+        await restore_nsl_entry_views(bot)
+        await restore_active_nsl_drafts(bot)
+        await restore_active_nsl_results(bot)
+
+    bot.add_listener(restore_persistent_nsl_state, "on_ready")
+
+    @bot.tree.command(name="stop_scrim", description="Stop the active NSL scrim in this channel")
+    async def stop_scrim(interaction: discord.Interaction) -> None:
+        if not isinstance(interaction.user, discord.Member) or not can_manage_nsl(interaction.user):
+            await interaction.response.send_message("Only an organizer or bot admin can stop a scrim.", ephemeral=True)
+            return
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("This command is only available in a text channel.", ephemeral=True)
+            return
+        stopped = await stop_scrim_in_channel(interaction.channel)
+        await interaction.response.send_message(
+            "The scrim was stopped and its saved state was cleared." if stopped else "There is no active scrim in this channel.",
+            ephemeral=True,
+        )
+
     @bot.tree.command(name="add_nsl_team", description="Create an NSL team role and private channels")
     @app_commands.describe(
         team_name="Team name",
@@ -1095,10 +1376,23 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             return
 
         active_nsl_match_ids.add(match.id)
-        view = NslMatchReadyView(team1, team2)
-        await channel.send(view.render(), view=view)
+        state_key = f"{NSL_READY_PREFIX}{match.id}"
+        view = NslMatchReadyView(team1, team2, state_key, {
+            "guild_id": interaction.guild.id, "team_a_role_id": team1.id, "team_b_role_id": team2.id,
+            "team_a_nsl_id": nsl_team1.id, "team_b_nsl_id": nsl_team2.id,
+            "team_a_member_ids": [member.id for member in team1_members],
+            "team_b_member_ids": [member.id for member in team2_members],
+            "clear_clans": [], "eco_clans": [], "scheduled_match_id": match.id,
+            "game_number": 1, "team_a_score": 0, "team_b_score": 0,
+            "team_a_previous_eco_picks": [], "team_b_previous_eco_picks": [],
+            "team_a_magic_available": True, "team_b_magic_available": True,
+        })
+        message = await channel.send(view.render(), view=view)
+        view.message = message
+        await view.persist()
         await interaction.followup.send(f"NSL match ready-check created: {channel.mention}", ephemeral=True)
         await view.wait()
+        await _delete_nsl_state(state_key)
         if not view.accepted():
             active_nsl_match_ids.discard(match.id)
             await channel.send("NSL match ready-check expired.")
@@ -1167,14 +1461,28 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             await interaction.followup.send("The bot cannot create a private scrim channel.", ephemeral=True)
             return
 
-        view = ScrimAcceptView(challenger_role, team_role)
-        await channel.send(
+        state_key = f"{NSL_INVITE_PREFIX}{channel.id}"
+        workflow = {
+            "guild_id": interaction.guild.id, "team_a_role_id": challenger_role.id, "team_b_role_id": team_role.id,
+            "team_a_nsl_id": challenger_team.id, "team_b_nsl_id": target_team.id,
+            "team_a_member_ids": [member.id for member in challenger_members],
+            "team_b_member_ids": [member.id for member in target_members],
+            "clear_clans": [], "eco_clans": [], "scheduled_match_id": None,
+            "game_number": 1, "team_a_score": 0, "team_b_score": 0,
+            "team_a_previous_eco_picks": [], "team_b_previous_eco_picks": [],
+            "team_a_magic_available": True, "team_b_magic_available": True,
+        }
+        view = ScrimAcceptView(challenger_role, team_role, state_key, workflow)
+        message = await channel.send(
             f"{team_role.mention}, **{challenger_role.name}** challenged you to a bo5 scrim.\n"
             f"At least one member of {team_role.mention} must accept within 2 minutes.",
             view=view,
         )
+        view.message = message
+        await view.persist()
         await interaction.followup.send(f"Scrim invite created: {channel.mention}", ephemeral=True)
         await view.wait()
+        await _delete_nsl_state(state_key)
         if not view.accepted:
             await channel.send("⌛ Scrim invite expired.")
             return

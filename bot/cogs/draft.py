@@ -3,10 +3,15 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.config import Settings
-from bot.services.draft_service import DraftSession, active_drafts, is_admin
+from bot.services.draft_service import DraftSession, active_drafts, is_admin, restore_active_drafts
 
 
 def register(bot: commands.Bot, settings: Settings) -> None:
+    async def restore_persistent_drafts() -> None:
+        await restore_active_drafts(bot)
+
+    bot.add_listener(restore_persistent_drafts, "on_ready")
+
     @bot.tree.command(name="start_draft_2v2", description="Запустить бан-пик Northgard 2v2")
     @app_commands.describe(
         player_1="Первый игрок",
