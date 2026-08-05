@@ -39,6 +39,8 @@ If nobody accepts, the invite expires. If the invite is accepted, a bo5 scrim st
 ## Draft Order
 
 Teams swap draft sides every game.
+At the start of the series, the team with the higher Elo is assigned side A.
+If Elo is equal, the initial side is selected randomly.
 
 ```text
 A ban clear

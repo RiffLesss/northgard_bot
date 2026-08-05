@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -277,6 +278,12 @@ def format_week_range(week_start: date, week_end: date) -> str:
     return f"{week_start.strftime('%B')} {ordinal(week_start.day)} - {week_end.strftime('%B')} {ordinal(week_end.day)}"
 
 
+def first_team_is_side_a(first_elo: int, second_elo: int) -> bool:
+    if first_elo == second_elo:
+        return random.choice([True, False])
+    return first_elo > second_elo
+
+
 async def role_for_nsl_team(guild: discord.Guild, team: NslTeam) -> discord.Role | None:
     role = guild.get_role(team.discord_role_id)
     if role is not None:
@@ -546,14 +553,18 @@ class ScrimDraftView(LoggedView):
             available = self.format_clans(self.available_options(step))
         active_bans = [ban.clan for ban in self.bans if not ban.reverted]
         reverted_bans = [ban.clan for ban in self.bans if ban.reverted]
+        side_a_role = side_role(self.context, "A")
+        side_b_role = side_role(self.context, "B")
+        side_a_members = side_members(self.context, "A")
+        side_b_members = side_members(self.context, "B")
         return (
             f"# ⚔️ NSL Scrim Draft · Game {self.context.game_number}\n\n"
             f"## 👥 Teams\n"
             f"**Series score:** {series_score(self.context)}\n"
-            f"**Team A:** {self.context.team_a_role.mention} · {team_mentions(self.context.team_a_members)}\n"
-            f"**Team B:** {self.context.team_b_role.mention} · {team_mentions(self.context.team_b_members)}\n"
-            f"**Draft side A:** {side_label(self.context, 'A')}\n"
-            f"**Draft side B:** {side_label(self.context, 'B')}\n\n"
+            f"**Draft side A:** {side_a_role.mention} · {team_mentions(side_a_members)}\n"
+            f"**Draft side B:** {side_b_role.mention} · {team_mentions(side_b_members)}\n"
+            f"**Series Team 1:** {self.context.team_a_role.mention}\n"
+            f"**Series Team 2:** {self.context.team_b_role.mention}\n\n"
             f"## ⏳ Current Action\n"
             f"**{action_team}** chooses: **{phase}**\n"
             f"Time left: **{self.remaining_text() if step is not None else '-'}**\n\n"
@@ -1369,6 +1380,11 @@ def register(bot: commands.Bot, settings: Settings) -> None:
             )
             return
 
+        if not first_team_is_side_a(nsl_team1.elo, nsl_team2.elo):
+            nsl_team1, nsl_team2 = nsl_team2, nsl_team1
+            team1, team2 = team2, team1
+            team1_members, team2_members = team2_members, team1_members
+
         try:
             channel = await create_scrim_channel(interaction.guild, team1, team2)
         except discord.Forbidden:
@@ -1486,6 +1502,11 @@ def register(bot: commands.Bot, settings: Settings) -> None:
         if not view.accepted:
             await channel.send("⌛ Scrim invite expired.")
             return
+
+        if not first_team_is_side_a(challenger_team.elo, target_team.elo):
+            challenger_team, target_team = target_team, challenger_team
+            challenger_role, team_role = team_role, challenger_role
+            challenger_members, target_members = target_members, challenger_members
 
         clear_clans, eco_clans = await load_clan_pools()
         context = ScrimContext(
