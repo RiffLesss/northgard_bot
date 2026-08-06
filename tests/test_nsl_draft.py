@@ -83,6 +83,11 @@ class NslDraftTest(unittest.TestCase):
 
         self.assertNotIn("Goat", team_a_options)
         self.assertIn("Goat", team_b_options)
+        self.assertNotIn("Goat", view.available_for_role(team_a))
+        self.assertIn("Goat", view.available_for_role(team_b))
+        rendered = view.render()
+        self.assertIn("Banned by fearless team Team A", rendered)
+        self.assertIn("Available team Team B", rendered)
 
 
 if __name__ == "__main__":

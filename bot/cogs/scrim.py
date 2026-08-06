@@ -485,6 +485,19 @@ class ScrimDraftView(LoggedView):
             return set(self.context.team_a_previous_eco_picks or set())
         return set(self.context.team_b_previous_eco_picks or set())
 
+    def fearless_bans_for_role(self, role: discord.Role) -> set[str]:
+        if role.id == self.context.team_a_role.id:
+            return set(self.context.team_a_previous_eco_picks or set())
+        return set(self.context.team_b_previous_eco_picks or set())
+
+    def available_for_role(self, role: discord.Role) -> list[str]:
+        fearless_bans = self.fearless_bans_for_role(role)
+        return [
+            clan
+            for clan in [*self.context.clear_clans, *self.context.eco_clans]
+            if clan not in self.active_bans() and clan not in fearless_bans
+        ]
+
     def clan_pool(self, step: ScrimDraftStep) -> list[str]:
         source = self.context.clear_clans if step.pick_type == PickType.CLEAR else self.context.eco_clans
         return [clan for clan in source if clan not in self.active_bans()]
@@ -557,8 +570,32 @@ class ScrimDraftView(LoggedView):
         side_b_role = side_role(self.context, "B")
         side_a_members = side_members(self.context, "A")
         side_b_members = side_members(self.context, "B")
+        team_a_fearless = self.fearless_bans_for_role(self.context.team_a_role)
+        team_b_fearless = self.fearless_bans_for_role(self.context.team_b_role)
         return (
-            f"# ⚔️ NSL Scrim Draft · Game {self.context.game_number}\n\n"
+            f"# NSL Scrim Draft · Game {self.context.game_number}\n\n"
+            f"## Teams\n"
+            f"**Series score:** {series_score(self.context)}\n"
+            f"**Team A:** {side_a_role.mention} · {team_mentions(side_a_members)}\n"
+            f"**Team B:** {side_b_role.mention} · {team_mentions(side_b_members)}\n\n"
+            f"## Current Action\n"
+            f"**{action_team}** chooses: **{phase}**\n"
+            f"Time left: **{self.remaining_text() if step is not None else '-'}**\n\n"
+            f"## Magic Cards\n{self.render_magic()}\n\n"
+            f"## Draft Table\n```text\n{self.render_draft_table()}\n```\n"
+            f"## Banned this game\n{self.format_clans(active_bans)}\n"
+            f"**Banned by fearless team {self.context.team_a_role.name}:** {self.format_clans(team_a_fearless)}\n"
+            f"**Banned by fearless team {self.context.team_b_role.name}:** {self.format_clans(team_b_fearless)}\n"
+            f"**Reverted by magic:** {self.format_clans(reverted_bans)}\n\n"
+            f"## Available clans\n"
+            f"**Available team {side_a_role.name}:** {self.format_clans(self.available_for_role(side_a_role))}\n"
+            f"**Available team {side_b_role.name}:** {self.format_clans(self.available_for_role(side_b_role))}\n\n"
+            f"## Available for current action\n{available}\n\n"
+            "Choose from the menu below."
+        )
+        if False:
+            return (
+                f"# ⚔️ NSL Scrim Draft · Game {self.context.game_number}\n\n"
             f"## 👥 Teams\n"
             f"**Series score:** {series_score(self.context)}\n"
             f"**Draft side A:** {side_a_role.mention} · {team_mentions(side_a_members)}\n"
@@ -730,6 +767,11 @@ class ScrimResultView(LoggedView):
         self.finished = False
         self.message: discord.Message | None = None
         self.deadline = time.time() + 86400
+        for item in self.children:
+            if getattr(item, "custom_id", None) == "nsl_result:team_a":
+                item.label = f"{self.context.team_a_role.name} won"
+            elif getattr(item, "custom_id", None) == "nsl_result:team_b":
+                item.label = f"{self.context.team_b_role.name} won"
 
     async def persist(self) -> None:
         if not is_database_configured() or self.message is None:
