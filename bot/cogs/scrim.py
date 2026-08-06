@@ -16,6 +16,7 @@ from bot.models.enums import DraftActionType, PickType
 from bot.models.nsl import NslTeam
 from bot.repositories.clan_repository import ClanRepository
 from bot.repositories.nsl_repository import NslTeamRepository
+from bot.repositories.nsl_draft_repository import NslDraftRepository
 from bot.repositories.runtime_state_repository import RuntimeStateRepository
 from bot.repositories.user_repository import UserRepository
 from bot.services.draft_service import is_admin
@@ -66,6 +67,7 @@ class ScrimContext:
     team_b_previous_eco_picks: set[str] | None = None
     team_a_magic_available: bool = True
     team_b_magic_available: bool = True
+    draft_game_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.team_a_previous_eco_picks is None:
@@ -94,6 +96,7 @@ def scrim_state(context: ScrimContext) -> dict:
         "team_b_previous_eco_picks": sorted(context.team_b_previous_eco_picks or set()),
         "team_a_magic_available": context.team_a_magic_available,
         "team_b_magic_available": context.team_b_magic_available,
+        "draft_game_id": context.draft_game_id,
     }
 
 
@@ -119,6 +122,7 @@ async def restore_scrim_context(bot: commands.Bot, state: dict) -> ScrimContext 
         team_b_previous_eco_picks=set(state.get("team_b_previous_eco_picks", [])),
         team_a_magic_available=bool(state["team_a_magic_available"]),
         team_b_magic_available=bool(state["team_b_magic_available"]),
+        draft_game_id=state.get("draft_game_id"),
     )
 
 
@@ -451,6 +455,36 @@ class ScrimDraftView(LoggedView):
             await RuntimeStateRepository(session).delete(f"{NSL_STATE_PREFIX}draft:{self.context.channel.id}")
             await session.commit()
 
+    def team_id_for_side(self, side: str) -> int:
+        role = side_role(self.context, side)
+        return self.context.team_a_nsl_id if role.id == self.context.team_a_role.id else self.context.team_b_nsl_id
+
+    async def record_action(self, step: ScrimDraftStep, clan: str) -> None:
+        if not is_database_configured() or self.context.draft_game_id is None:
+            return
+        async with get_session_factory()() as session:
+            clans = ClanRepository(session)
+            clan_model = await clans.get_by_name(clan)
+            if clan_model is None:
+                return
+            await NslDraftRepository(session).add_action(
+                self.context.draft_game_id,
+                self.team_id_for_side(step.side),
+                clan_model.id,
+                step.action_type,
+                step.pick_type,
+            )
+            await session.commit()
+
+    async def mark_reverted_action(self, clan: str) -> None:
+        if not is_database_configured() or self.context.draft_game_id is None:
+            return
+        async with get_session_factory()() as session:
+            clan_model = await ClanRepository(session).get_by_name(clan)
+            if clan_model is not None:
+                await NslDraftRepository(session).mark_reverted(self.context.draft_game_id, clan_model.id)
+                await session.commit()
+
     def current_step(self) -> ScrimDraftStep | None:
         if self.step_index >= len(SCRIM_DRAFT_STEPS):
             return None
@@ -639,6 +673,7 @@ class ScrimDraftView(LoggedView):
             else:
                 self.picks[step.side].append(clan)
             self.draft_results.append(clan)
+            await self.record_action(step, clan)
             self.step_index += 1
             await self.finish_or_continue(interaction)
 
@@ -661,6 +696,7 @@ class ScrimDraftView(LoggedView):
                 if ban.clan == clan and ban.side != step.side and not ban.fearless and not ban.reverted:
                     ban.reverted = True
                     self.spend_magic(step.side)
+                    await self.mark_reverted_action(clan)
                     self.refresh_items()
                     await interaction.response.edit_message(content=self.render(), view=self)
                     return
@@ -685,6 +721,7 @@ class ScrimDraftView(LoggedView):
             else:
                 self.picks[step.side].append(clan)
             self.draft_results.append(clan)
+            await self.record_action(step, clan)
             self.step_index += 1
             await self.finish_or_continue()
 
@@ -825,6 +862,15 @@ class ScrimResultView(LoggedView):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
+        if is_database_configured() and self.context.draft_game_id is not None:
+            winner_nsl_id = (
+                self.context.team_a_nsl_id
+                if winner_id == self.context.team_a_role.id
+                else self.context.team_b_nsl_id
+            )
+            async with get_session_factory()() as session:
+                await NslDraftRepository(session).finish_game(self.context.draft_game_id, winner_nsl_id)
+                await session.commit()
         if winner_id == self.context.team_a_role.id:
             self.context.team_a_score += 1
         else:
@@ -841,6 +887,7 @@ class ScrimResultView(LoggedView):
             self.stop()
             return
         self.context.game_number += 1
+        self.context.draft_game_id = None
         await self.context.channel.send(
             f"Game result confirmed: **{winner_role.name}** won.\n"
             f"Series score: **{series_score(self.context)}**.\n"
@@ -861,6 +908,17 @@ class ScrimResultView(LoggedView):
 
 
 async def start_scrim_draft(bot: commands.Bot, context: ScrimContext) -> None:
+    if is_database_configured() and context.draft_game_id is None:
+        async with get_session_factory()() as session:
+            game = await NslDraftRepository(session).create_game(
+                channel_id=context.channel.id,
+                game_number=context.game_number,
+                team_a_id=context.team_a_nsl_id,
+                team_b_id=context.team_b_nsl_id,
+                scheduled_match_id=context.scheduled_match_id,
+            )
+            await session.commit()
+            context.draft_game_id = game.id
     view = ScrimDraftView(bot, context)
     message = await context.channel.send(view.render(), view=view)
     view.message = message

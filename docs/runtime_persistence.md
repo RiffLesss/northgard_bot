@@ -25,12 +25,13 @@ NSL invitations and scheduled ready-checks also persist their messages, team
 roles, participants and acceptance state; an already accepted workflow resumes
 by entering the scrim draft.
 
-Apply the migration before deploying:
+Apply the migrations before deploying:
 
 ```text
 alembic upgrade head
 ```
 
-The next persistence steps are to store the active 2v2/3v3/NSL draft state and
-their message/channel IDs. A running `asyncio` task itself is never persisted;
-after restart it must be rebuilt from the saved state and deadline.
+NSL draft actions and game winners are stored relationally in
+`nsl_draft_games` and `nsl_draft_actions`, which also powers the team statistics
+report. A running `asyncio` task itself is never persisted; after restart it
+must be rebuilt from the saved state and deadline.

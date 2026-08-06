@@ -9,6 +9,7 @@ When adding or changing project documentation, update this index in the same cha
 - [NSL Scrims](docs/nsl_scrims.md) - how tournament team setup, scrim invites, bo5 draft order, fearless eco picks, magic cards, and result confirmation work.
 - [NSL Tournament](docs/nsl_tournament.md) - how NSL schedule generation, scheduled match starts, and Elo updates work.
 - [Persistent Workflows](docs/runtime_persistence.md) - how interactive Discord state is stored and restored after restart.
+- [NSL Team Statistics](docs/nsl_team_stats.md) - how to generate draft statistics for an NSL team.
 
 ## Project Entry Points
 
